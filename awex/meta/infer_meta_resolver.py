@@ -256,10 +256,22 @@ class InferParamMetaResolver(ParamMetaResolver):
                 )
 
             # Compute global shape
+            # IMPORTANT: EP_SHARDING is different from TP_SHARDING!
+            # - TP_SHARDING: A single tensor is split across ranks → global_numel = local_numel * num_shards
+            # - EP_SHARDING: Different experts are assigned to different ranks → global_numel = local_numel
+            #   Each expert parameter (e.g., experts.20.weight) is COMPLETE on its rank, not a shard.
+            #   The "sharding" is at the expert level, not the tensor level.
             num_dims = len(local_shape)
             if sharding_type == ShardingType.NO_SHARDING or num_shards == 1:
                 global_shape = tuple(local_shape)
                 global_numel = local_numel
+            elif sharding_type == ShardingType.EP_SHARDING:
+                # EP sharding: experts are distributed across ranks, not tensor-sharded
+                # Each expert's parameters are complete, so global_numel = local_numel
+                global_shape = tuple(local_shape)
+                global_numel = local_numel
+                # For EP, num_shards represents how many ranks have this parameter name
+                # (i.e., each rank has different experts but may have same local expert indices)
             else:
                 global_shape = tuple(
                     local_shape[i] * num_shards if i == sharding_dim else local_shape[i]
@@ -268,61 +280,82 @@ class InferParamMetaResolver(ParamMetaResolver):
                 global_numel = local_numel * num_shards
 
             # Generate shards for all ranks
+            # IMPORTANT: For EP_SHARDING, each expert is complete (not a shard of a larger tensor).
+            # We only create 1 shard representing this expert on its assigned rank.
+            # For TP/DP_TP sharding, we create num_shards virtual shards.
             shards = []
-            for shard_idx in range(num_shards):
-                # Compute global offset for this shard
-                global_offset = tuple(
-                    shard_idx * local_shape[i] if i == sharding_dim else 0
-                    for i in range(num_dims)
-                )
-
-                # Determine rank values based on sharding type
-                if sharding_type == ShardingType.TP_SHARDING:
-                    tp_rank = shard_idx
-                    attn_tp_rank = shard_idx % rank_info.attn_tp_size
-                    ep_rank = 0
-                    ep_tp_rank = 0
-                elif sharding_type == ShardingType.DP_TP_SHARDING:
-                    tp_rank = shard_idx
-                    attn_tp_rank = shard_idx
-                    ep_rank = 0
-                    ep_tp_rank = 0
-                elif sharding_type == ShardingType.EP_SHARDING:
-                    tp_rank = 0
-                    attn_tp_rank = 0
-                    ep_rank = shard_idx
-                    ep_tp_rank = 0
-                elif sharding_type == ShardingType.EP_TP_SHARDING:
-                    tp_rank = shard_idx
-                    attn_tp_rank = shard_idx % rank_info.attn_tp_size
-                    ep_rank = shard_idx // rank_info.ep_tp_size if rank_info.ep_tp_size > 0 else 0
-                    ep_tp_rank = shard_idx % rank_info.ep_tp_size if rank_info.ep_tp_size > 0 else 0
-                else:
-                    # NO_SHARDING or unknown
-                    tp_rank = 0
-                    attn_tp_rank = 0
-                    ep_rank = 0
-                    ep_tp_rank = 0
-
+            if sharding_type == ShardingType.EP_SHARDING:
+                # EP sharding: single shard representing this complete expert
                 shard = ParameterShardMeta(
                     name=name,
-                    tp_rank=tp_rank,
-                    attn_tp_rank=attn_tp_rank,
+                    tp_rank=0,
+                    attn_tp_rank=0,
                     pp_rank=rank_info.pp_rank,
-                    ep_rank=ep_rank,
-                    ep_tp_rank=ep_tp_rank,
-                    global_rank=shard_idx,  # Virtual global rank
+                    ep_rank=rank_info.ep_rank,  # Use actual ep_rank from local metadata
+                    ep_tp_rank=0,
+                    global_rank=rank_info.global_rank,
                     engine_rank=rank_info.engine_rank,
                     world_size=rank_info.world_size,
                     shape=local_shape,
                     numel=local_numel,
                     dtype=dtype,
-                    global_offset=global_offset,
+                    global_offset=tuple(0 for _ in range(num_dims)),
                     sharding_type=sharding_type,
-                    num_shards=num_shards,
+                    num_shards=1,  # Each expert is complete, not sharded
                     sharding_dim=sharding_dim,
                 )
                 shards.append(shard)
+            else:
+                # TP/DP_TP/EP_TP sharding: create virtual shards for all ranks
+                for shard_idx in range(num_shards):
+                    # Compute global offset for this shard
+                    global_offset = tuple(
+                        shard_idx * local_shape[i] if i == sharding_dim else 0
+                        for i in range(num_dims)
+                    )
+
+                    # Determine rank values based on sharding type
+                    if sharding_type == ShardingType.TP_SHARDING:
+                        tp_rank = shard_idx
+                        attn_tp_rank = shard_idx % rank_info.attn_tp_size
+                        ep_rank = 0
+                        ep_tp_rank = 0
+                    elif sharding_type == ShardingType.DP_TP_SHARDING:
+                        tp_rank = shard_idx
+                        attn_tp_rank = shard_idx
+                        ep_rank = 0
+                        ep_tp_rank = 0
+                    elif sharding_type == ShardingType.EP_TP_SHARDING:
+                        tp_rank = shard_idx
+                        attn_tp_rank = shard_idx % rank_info.attn_tp_size
+                        ep_rank = shard_idx // rank_info.ep_tp_size if rank_info.ep_tp_size > 0 else 0
+                        ep_tp_rank = shard_idx % rank_info.ep_tp_size if rank_info.ep_tp_size > 0 else 0
+                    else:
+                        # NO_SHARDING or unknown
+                        tp_rank = 0
+                        attn_tp_rank = 0
+                        ep_rank = 0
+                        ep_tp_rank = 0
+
+                    shard = ParameterShardMeta(
+                        name=name,
+                        tp_rank=tp_rank,
+                        attn_tp_rank=attn_tp_rank,
+                        pp_rank=rank_info.pp_rank,
+                        ep_rank=ep_rank,
+                        ep_tp_rank=ep_tp_rank,
+                        global_rank=shard_idx,  # Virtual global rank
+                        engine_rank=rank_info.engine_rank,
+                        world_size=rank_info.world_size,
+                        shape=local_shape,
+                        numel=local_numel,
+                        dtype=dtype,
+                        global_offset=global_offset,
+                        sharding_type=sharding_type,
+                        num_shards=num_shards,
+                        sharding_dim=sharding_dim,
+                    )
+                    shards.append(shard)
 
             # Create ParameterMeta with single replica containing all shards
             param = ParameterMeta(

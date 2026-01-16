@@ -52,6 +52,26 @@ class McoreParamMetaResolver(ParamMetaResolver):
             get_mcore_sharding_strategy,
         )
 
+        # === DEBUG: Print raw Megatron parallelism values ===
+        from megatron.core import parallel_state as mpu
+        import torch.distributed as dist
+        _debug_tp_size = mpu.get_tensor_model_parallel_world_size()
+        _debug_tp_rank = mpu.get_tensor_model_parallel_rank()
+        _debug_pp_size = mpu.get_pipeline_model_parallel_world_size()
+        _debug_pp_rank = mpu.get_pipeline_model_parallel_rank()
+        _debug_ep_size = mpu.get_expert_model_parallel_world_size()
+        _debug_ep_rank = mpu.get_expert_model_parallel_rank()
+        _debug_world_size = dist.get_world_size()
+        _debug_global_rank = dist.get_rank()
+        logger.info(
+            f"[MEGATRON_PARALLELISM_DEBUG] global_rank={_debug_global_rank}, "
+            f"world_size={_debug_world_size}, "
+            f"tp_size={_debug_tp_size}, tp_rank={_debug_tp_rank}, "
+            f"pp_size={_debug_pp_size}, pp_rank={_debug_pp_rank}, "
+            f"ep_size={_debug_ep_size}, ep_rank={_debug_ep_rank}"
+        )
+        # === END DEBUG ===
+
         self._rank_info = get_mcore_rank_info()
         self._sharding_strategy = get_mcore_sharding_strategy(
             self._model_arch_name,

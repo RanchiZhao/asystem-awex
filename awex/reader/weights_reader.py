@@ -228,42 +228,67 @@ class WeightsReader(WeightExchangeReader):
         logger.info(
             "Finished querying and building parameters meta from all tp workers"
         )
+        logger.info(f"[PROFILE] _initialize: Building infer_conf dict for engine_rank={self.engine_rank}")
+        try:
+            attn_tp_size = self.meta_resolver.rank0_info.attn_tp_size
+            logger.info(f"[PROFILE] _initialize: Got attn_tp_size={attn_tp_size}")
+        except Exception as e:
+            logger.error(f"[PROFILE] _initialize: FAILED to get attn_tp_size: {e}")
+            raise
+        router_dtype = getattr(self.hf_config, "router_dtype", "bf16")
+        logger.info(f"[PROFILE] _initialize: Got router_dtype={router_dtype}")
+        hf_config_simple = simple_hf_config(self.hf_config)
+        logger.info(f"[PROFILE] _initialize: Got simple_hf_config")
         self.infer_conf = {
-            "infer_atten_tp_size": self.meta_resolver.rank0_info.attn_tp_size,
-            "router_dtype": getattr(self.hf_config, "router_dtype", "bf16"),
+            "infer_atten_tp_size": attn_tp_size,
+            "router_dtype": router_dtype,
             "infer_engine_config": self.infer_engine_config,
-            "hf_config": simple_hf_config(self.hf_config),
+            "hf_config": hf_config_simple,
             "infer_world_size": self.infer_world_size,
         }
-        self.meta_server_client.put_object("infer_conf", self.infer_conf)
-        logger.info(f"Put inference config {self.infer_conf} to meta server")
+        logger.info(f"[PROFILE] _initialize: infer_conf built successfully for engine_rank={self.engine_rank}")
+
+        # Only let engine_rank=0 put infer_conf to avoid 128 workers flooding MetaServer
         if self.engine_rank == 0:
+            logger.info(f"[PROFILE] _initialize: Calling meta_server_client.put_object('infer_conf') for engine_rank={self.engine_rank}")
+            t_put_start = time.time()
+            self.meta_server_client.put_object("infer_conf", self.infer_conf)
+            t_put_end = time.time()
+            logger.info(f"[PROFILE] _initialize: put_object('infer_conf') took {t_put_end - t_put_start:.3f}s for engine_rank={self.engine_rank}")
+            logger.info(f"Put inference config {self.infer_conf} to meta server")
             self.meta_server_client.put_object(
                 "infer_params_meta", self.parameters_meta
             )
             logger.info("Put inference parameters meta to meta server")
+        else:
+            logger.info(f"[PROFILE] _initialize: Skipping put_object('infer_conf') for engine_rank={self.engine_rank} (only engine_rank=0 does this)")
         logger.info(
-            f"Start to get training parameters meta from meta server for engine rank {self.engine_rank}"
+            f"[PROFILE] _initialize: Start to get training_params_meta from meta server for engine_rank={self.engine_rank}"
         )
+        t_get_start = time.time()
         self.training_params_meta = self.meta_server_client.get_object(
             "training_params_meta", timeout=self.timeout
         )
-        logger.info("Finished getting training parameters meta from meta server")
+        t_get_end = time.time()
+        logger.info(f"[PROFILE] _initialize: get_object('training_params_meta') took {t_get_end - t_get_start:.3f}s for engine_rank={self.engine_rank}")
         self.training_world_size = self.training_params_meta[0].shards[0].world_size
         config = self.inference_engine.config
         # In colocate mode, training and inference may have different parallelism (e.g., EP=8 vs EP=1)
         # so shape mismatches are expected. Only raise exceptions in non-colocate, non-debug mode.
         should_raise = not config.enable_debug_mode and not config.enable_colocate_mode
+        # In colocate mode, skip numel checks entirely since sharding strategies differ
         check_train_infer_params_meta(
             self.training_params_meta,
             self.parameters_meta,
             raise_exception=should_raise,
             hf_config=self.hf_config,
+            skip_numel_check=config.enable_colocate_mode,
         )
         logger.info("Start to send parameters meta to tp workers")
         infer_parameters_meta_bytes = pickle.dumps(self.parameters_meta)
         train_parameters_meta_bytes = pickle.dumps(self.training_params_meta)
         infer_conf_bytes = pickle.dumps(self.infer_conf)
+        # 卡在这里
         self.inference_engine.execute_task_in_model_worker(
             self._init_in_tp_worker,
             infer_conf_bytes=infer_conf_bytes,
@@ -337,6 +362,10 @@ class WeightsReader(WeightExchangeReader):
     def update_weights(self, step_id, **kwargs):
         with self.lock:
             _log_gpu_memory(f"WeightsReader.update_weights START step={step_id}")
+            logger.info(
+                f"[PROFILE] update_weights ENTERED step={step_id} engine_rank={self.engine_rank} "
+                f"enable_colocate_mode={self.enable_colocate_mode} initialized={self.initialized}"
+            )
             if not self.initialized:
                 logger.info(
                     f"Start to initialize weights exchange reader for engine rank {self.engine_rank}"
@@ -347,10 +376,16 @@ class WeightsReader(WeightExchangeReader):
                     f"Finished initializing weights exchange reader for engine rank {self.engine_rank}"
                 )
                 _log_gpu_memory(f"WeightsReader.update_weights AFTER _initialize step={step_id}")
+            logger.info(f"[PROFILE] update_weights CALLING _pre_validate_weights step={step_id} engine_rank={self.engine_rank}")
             self._pre_validate_weights(step_id, **kwargs)
+            logger.info(f"[PROFILE] update_weights AFTER _pre_validate_weights step={step_id} engine_rank={self.engine_rank}")
             start_time = time.time()
             logger.info(
                 f"Start to update weights for step {step_id} for engine rank {self.engine_rank}"
+            )
+            logger.info(
+                f"[PROFILE] update_weights CHECKING colocate_mode step={step_id} "
+                f"enable_colocate_mode={self.enable_colocate_mode} engine_rank={self.engine_rank}"
             )
             if self.enable_colocate_mode:
                 _log_gpu_memory(f"WeightsReader.update_weights BEFORE release step={step_id}")
@@ -471,9 +506,17 @@ class WeightsReader(WeightExchangeReader):
             logger.info(f"[_resume_kvcache_in_tp_worker] kv_cache not in offload_tags, skipping")
 
     def _pre_validate_weights(self, step_id, **kwargs):
+        logger.info(
+            f"[PROFILE] _pre_validate_weights START step={step_id} "
+            f"validated_steps={self.validated_steps} weights_validation_steps={self.weights_validation_steps} "
+            f"engine_rank={self.engine_rank}"
+        )
         if self.validated_steps == 0:
             self.start_step = step_id
         if self.validated_steps >= self.weights_validation_steps:
+            logger.info(
+                f"[PROFILE] _pre_validate_weights SKIP (validation disabled) step={step_id} engine_rank={self.engine_rank}"
+            )
             return
         if (step_id - self.start_step) % self.validate_weights_every_n_steps != 0:
             return
@@ -848,10 +891,24 @@ class WorkerWeightsReader:
             model_context, engine_rank
         )
         logger.info(f"Reader rank info: {self.rank_info}")
-        self.transfer_rank = (
-            +self.engine_rank * self.infer_instance_world_size
-            + self.rank_info.global_rank
-        )
+        # In colocate multi-engine mode, dist.get_rank() returns the real global rank
+        # (0 to infer_world_size-1), not the per-engine rank. So we don't need to add
+        # engine_rank * infer_instance_world_size offset.
+        # In single-engine or non-colocate mode, global_rank is per-engine (0 to instance_world_size-1),
+        # so we need the engine_rank offset.
+        if self.enable_colocate_mode and self.num_engines > 1:
+            # Colocate multi-engine: global_rank is already the real rank
+            self.transfer_rank = self.rank_info.global_rank
+            logger.info(
+                f"[COLOCATE] Using real global_rank directly as transfer_rank: {self.transfer_rank} "
+                f"(num_engines={self.num_engines}, engine_rank={self.engine_rank})"
+            )
+        else:
+            # Single engine or non-colocate: need engine_rank offset
+            self.transfer_rank = (
+                +self.engine_rank * self.infer_instance_world_size
+                + self.rank_info.global_rank
+            )
         self.meta_server_addr = meta_server_addr
         self.meta_server_client = MetaServerClient(*self.meta_server_addr.split(":"))
         self.weight_converter = get_infer_weights_converter(

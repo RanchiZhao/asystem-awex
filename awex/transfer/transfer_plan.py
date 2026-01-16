@@ -375,8 +375,32 @@ class TransferPlanBuilder:
     def _compute_shard_transfer_rank(
         self, shard: ParameterShardMeta, engine_rank: int, is_infer: bool
     ) -> int:
+        """
+        Compute the transfer rank for a shard.
+
+        For inference shards:
+        - TP_SHARDING: shard.global_rank is virtual (0 to instance_world_size-1)
+          → Need to add engine_rank * instance_world_size to get real rank
+        - EP_SHARDING: shard.global_rank is already real (0 to infer_world_size-1)
+          → In multi-engine colocate mode, already the correct rank
+
+        For training shards:
+        - global_rank is always virtual, need to add infer_world_size offset
+        """
         if is_infer:
-            return shard.global_rank + engine_rank * self.infer_instance_world_size
+            # In colocate mode with multiple engines, EP_SHARDING params already have
+            # real global_rank (because EP uses actual rank that owns each expert).
+            # Don't add engine_rank offset for these.
+            from awex.sharding.param_sharding import ShardingType
+            if (self.enable_colocate_mode and
+                self.num_infer_engines > 1 and
+                hasattr(shard, 'sharding_type') and
+                shard.sharding_type == ShardingType.EP_SHARDING):
+                # EP sharding in multi-engine colocate mode: global_rank is already real
+                return shard.global_rank
+            else:
+                # TP/other sharding: global_rank is virtual, needs engine_rank offset
+                return shard.global_rank + engine_rank * self.infer_instance_world_size
         else:
             assert engine_rank == 0, "Training only has one engine instance"
             return shard.global_rank + self.infer_world_size

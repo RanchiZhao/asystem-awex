@@ -298,9 +298,18 @@ def check_train_infer_params_meta(
     infer_parameters_meta: List,
     raise_exception: bool = False,
     hf_config=None,
+    skip_numel_check: bool = False,
 ):
     """
     Check consistency between training and inference parameter metadata.
+
+    Args:
+        training_params_meta: Training side parameter metadata
+        infer_parameters_meta: Inference side parameter metadata
+        raise_exception: Whether to raise exception on error
+        hf_config: HuggingFace config for special case handling
+        skip_numel_check: If True, skip numel/shape checks (for colocate mode where
+                          training and inference sharding are different)
 
     Returns:
         int: Number of errors found (0 means all checks passed)
@@ -373,16 +382,27 @@ def check_train_infer_params_meta(
         infer_param_meta = infer_meta[param_name]
         train_param_meta = train_meta[param_name]
 
-        # Skip shape/numel validation for qkv_proj with KV head replication
-        skip_shape_check = _is_qkv_param_with_kv_replication(
-            param_name, infer_param_meta, train_param_meta, hf_config
-        )
-
-        # Skip shape/numel validation for embedding/lm_head with vocab padding mismatch
-        if not skip_shape_check:
-            skip_shape_check = _is_vocab_padding_mismatch(
+        # Global skip_numel_check takes precedence (for colocate mode with different sharding)
+        if skip_numel_check:
+            skip_shape_check = True
+            if infer_param_meta.global_numel != train_param_meta.global_numel:
+                # Log as warning instead of error when skip_numel_check is True
+                logger.warning(
+                    f"[METADATA_CHECK] SKIPPED numel check for {param_name}: "
+                    f"infer={infer_param_meta.global_numel} vs train={train_param_meta.global_numel} "
+                    f"(skip_numel_check=True, colocate mode with different sharding)"
+                )
+        else:
+            # Skip shape/numel validation for qkv_proj with KV head replication
+            skip_shape_check = _is_qkv_param_with_kv_replication(
                 param_name, infer_param_meta, train_param_meta, hf_config
             )
+
+            # Skip shape/numel validation for embedding/lm_head with vocab padding mismatch
+            if not skip_shape_check:
+                skip_shape_check = _is_vocab_padding_mismatch(
+                    param_name, infer_param_meta, train_param_meta, hf_config
+                )
 
         if not skip_shape_check:
             if infer_param_meta.global_numel != train_param_meta.global_numel:

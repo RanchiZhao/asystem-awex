@@ -32,11 +32,14 @@ class RankInfo:
         attn_tp_rank (int): Attention tensor parallel rank.
         attn_tp_size (int): Attention tensor parallel size.
         attn_dp_rank (int): Attention data parallel rank.
-        world_size (int): Total world size.
-        global_rank (int): Global rank of the worker.
+        world_size (int): Total world size (within engine for multi-engine mode).
+        global_rank (int): Global rank within engine (0 to world_size-1 for multi-engine).
         local_rank (int): Local rank of the worker.
-        engine_rank (int): Engine rank of the worker.
+        engine_rank (int): Engine rank of the worker (0 to num_engines-1).
         is_infer (bool): Whether the worker is an inference worker.
+        true_global_rank (int): True global rank across all engines (0 to total_world_size-1).
+        num_engines (int): Total number of inference engines.
+        infer_instance_world_size (int): World size per inference engine instance.
     """
 
     tp_rank: int
@@ -57,3 +60,15 @@ class RankInfo:
     local_rank: int
     engine_rank: int
     is_infer: bool
+    true_global_rank: int = None  # Real global rank (0 to infer_world_size-1)
+    num_engines: int = 1  # Total number of inference engines
+    infer_instance_world_size: int = None  # World size per engine (tp_size * pp_size)
+
+    def __post_init__(self):
+        """Initialize derived fields if not provided."""
+        if self.true_global_rank is None:
+            # Default: true_global_rank equals global_rank for backward compatibility
+            self.true_global_rank = self.global_rank
+        if self.infer_instance_world_size is None:
+            # Default: compute from tp_size and pp_size
+            self.infer_instance_world_size = self.tp_size * self.pp_size

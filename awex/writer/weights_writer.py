@@ -202,11 +202,14 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
             infer_params_meta_binary
         )
         logger.info("Finished getting inference parameters meta from meta server")
+        # In colocate mode, training and inference have different sharding strategies,
+        # so we skip numel/shape checks. The P2P transfer will handle the reshard.
         check_train_infer_params_meta(
             self.parameters_meta,
             self.infer_params_meta,
             raise_exception=not self.enable_debug_mode,
             hf_config=self.hf_config,
+            skip_numel_check=self.enable_colocate_mode,
         )
         self.weight_converter = get_train_weights_converter(
             self.train_engine.engine_name,
