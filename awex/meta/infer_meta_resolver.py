@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Tuple
 from awex.meta.meta_resolver import ParamMetaResolver, logger
 from awex.meta.weight_meta import (
     ParameterMeta,
+    ParameterReplicaMeta,
+    ParameterShardMeta,
     compute_total_model_size,
     dump_parameters_meta,
 )
@@ -56,6 +58,9 @@ class InferParamMetaResolver(ParamMetaResolver):
         self.engine_rank = engine_rank
 
         logger.info(f"[PROFILE] InferParamMetaResolver.__init__: engine_rank={engine_rank}, convert_params={convert_params}")
+        # Log vocab_size from HF config to help diagnose padding issues
+        vocab_size = getattr(inference_engine.hf_config, "vocab_size", None)
+        logger.info(f"[VOCAB_DEBUG] HF config vocab_size={vocab_size}")
 
         suffix = f"{engine_rank}_{os.getpid()}_{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}.json"
         if self._inference_engine.config.enable_debug_mode:
@@ -127,6 +132,12 @@ class InferParamMetaResolver(ParamMetaResolver):
             self.infer_engine_config,
             self.rank0_info,
         )
+        # Log which sharding strategy class is being used
+        logger.info(
+            f"[SHARDING_CLASS] Using {type(self._sharding_strategy).__name__} for {self._model_arch_name}, "
+            f"enable_dp_attention={self._sharding_strategy.enable_dp_attention}, "
+            f"enable_dp_lm_head={self._sharding_strategy.enable_dp_lm_head}"
+        )
         self._params_meta = self._build_params_meta()
         if self._inference_engine.config.enable_debug_mode:
             filename = f"infer_params_meta_{suffix}"
@@ -158,6 +169,187 @@ class InferParamMetaResolver(ParamMetaResolver):
         return self._sharding_strategy.get_sharding_strategy(
             name, rank_info=rank_info, param_meta=param_meta
         )
+
+    def _build_params_meta(self) -> List[ParameterMeta]:
+        """
+        Override parent method to handle colocate mode.
+
+        In colocate mode, we only have metadata from a single rank (local metadata).
+        We use sharding strategy to infer the complete shard structure for all ranks.
+        """
+        all_params_raw_meta = self._get_params_raw_meta()
+        enable_colocate = getattr(self._inference_engine.config, "enable_colocate_mode", False)
+
+        logger.info(
+            f"[COLOCATE_CHECK] enable_colocate={enable_colocate}, "
+            f"num_raw_meta={len(all_params_raw_meta)}, "
+            f"config_type={type(self._inference_engine.config).__name__}"
+        )
+
+        # In colocate mode with only local metadata, use inference-based approach
+        if enable_colocate and len(all_params_raw_meta) == 1:
+            logger.info(
+                f"[COLOCATE] Building params meta from local metadata only "
+                f"(inferring {self.rank0_info.attn_tp_size} shards from sharding strategy)"
+            )
+            return self._build_params_meta_from_local(all_params_raw_meta[0])
+
+        # Otherwise, use parent's implementation (has all ranks' metadata)
+        logger.info(
+            f"[COLOCATE_CHECK] Using parent _build_params_meta (non-colocate or has all ranks)"
+        )
+        return super()._build_params_meta()
+
+    def _build_params_meta_from_local(self, local_meta: Dict[str, Any]) -> List[ParameterMeta]:
+        """
+        Build complete ParameterMeta list from a single rank's metadata.
+
+        In colocate mode, we only have local metadata from one rank. We use the
+        sharding strategy to infer the complete shard structure for all ranks.
+
+        For each parameter:
+        1. Get sharding info (sharding_type, sharding_dim, num_shards) from strategy
+        2. Infer global shape from local shape and num_shards
+        3. Generate virtual shards for all ranks with computed offsets
+
+        Args:
+            local_meta: Metadata dict from a single rank containing 'rank_info' and 'params_meta'
+
+        Returns:
+            List of ParameterMeta with complete shard information
+        """
+        rank_info: RankInfo = local_meta["rank_info"]
+        local_params_meta = local_meta["params_meta"]
+
+        logger.info(
+            f"[COLOCATE] Inferring params meta from local rank {rank_info.global_rank}: "
+            f"attn_tp_size={rank_info.attn_tp_size}, ep_size={rank_info.ep_size}, "
+            f"tp_size={rank_info.tp_size}, world_size={rank_info.world_size}"
+        )
+
+        params_meta_list = []
+
+        for param_meta in local_params_meta:
+            name = param_meta["name"]
+            local_shape = param_meta["shape"]
+            local_numel = param_meta["numel"]
+            dtype = param_meta["dtype"]
+
+            # Get sharding strategy for this parameter
+            sharding_type, sharding_dim, num_shards = self._get_sharding_info(
+                name, rank_info, param_meta
+            )
+
+            # Debug log for key parameters (attention, shared_experts, embedding, lm_head)
+            should_log = any(k in name for k in [
+                "kv_b_proj", "q_b_proj", "o_proj",  # attention
+                "shared_experts",  # shared experts (key issue!)
+                "embed_tokens", "lm_head",  # embedding and output
+            ])
+            if should_log:
+                logger.info(
+                    f"[COLOCATE_DEBUG] {name}: "
+                    f"sharding_type={sharding_type}, num_shards={num_shards}, "
+                    f"sharding_dim={sharding_dim}, local_shape={local_shape}, "
+                    f"enable_dp_attention={self._sharding_strategy.enable_dp_attention}, "
+                    f"strategy_class={type(self._sharding_strategy).__name__}"
+                )
+
+            # Compute global shape
+            num_dims = len(local_shape)
+            if sharding_type == ShardingType.NO_SHARDING or num_shards == 1:
+                global_shape = tuple(local_shape)
+                global_numel = local_numel
+            else:
+                global_shape = tuple(
+                    local_shape[i] * num_shards if i == sharding_dim else local_shape[i]
+                    for i in range(num_dims)
+                )
+                global_numel = local_numel * num_shards
+
+            # Generate shards for all ranks
+            shards = []
+            for shard_idx in range(num_shards):
+                # Compute global offset for this shard
+                global_offset = tuple(
+                    shard_idx * local_shape[i] if i == sharding_dim else 0
+                    for i in range(num_dims)
+                )
+
+                # Determine rank values based on sharding type
+                if sharding_type == ShardingType.TP_SHARDING:
+                    tp_rank = shard_idx
+                    attn_tp_rank = shard_idx % rank_info.attn_tp_size
+                    ep_rank = 0
+                    ep_tp_rank = 0
+                elif sharding_type == ShardingType.DP_TP_SHARDING:
+                    tp_rank = shard_idx
+                    attn_tp_rank = shard_idx
+                    ep_rank = 0
+                    ep_tp_rank = 0
+                elif sharding_type == ShardingType.EP_SHARDING:
+                    tp_rank = 0
+                    attn_tp_rank = 0
+                    ep_rank = shard_idx
+                    ep_tp_rank = 0
+                elif sharding_type == ShardingType.EP_TP_SHARDING:
+                    tp_rank = shard_idx
+                    attn_tp_rank = shard_idx % rank_info.attn_tp_size
+                    ep_rank = shard_idx // rank_info.ep_tp_size if rank_info.ep_tp_size > 0 else 0
+                    ep_tp_rank = shard_idx % rank_info.ep_tp_size if rank_info.ep_tp_size > 0 else 0
+                else:
+                    # NO_SHARDING or unknown
+                    tp_rank = 0
+                    attn_tp_rank = 0
+                    ep_rank = 0
+                    ep_tp_rank = 0
+
+                shard = ParameterShardMeta(
+                    name=name,
+                    tp_rank=tp_rank,
+                    attn_tp_rank=attn_tp_rank,
+                    pp_rank=rank_info.pp_rank,
+                    ep_rank=ep_rank,
+                    ep_tp_rank=ep_tp_rank,
+                    global_rank=shard_idx,  # Virtual global rank
+                    engine_rank=rank_info.engine_rank,
+                    world_size=rank_info.world_size,
+                    shape=local_shape,
+                    numel=local_numel,
+                    dtype=dtype,
+                    global_offset=global_offset,
+                    sharding_type=sharding_type,
+                    num_shards=num_shards,
+                    sharding_dim=sharding_dim,
+                )
+                shards.append(shard)
+
+            # Create ParameterMeta with single replica containing all shards
+            param = ParameterMeta(
+                name=name,
+                global_numel=global_numel,
+                global_shape=global_shape,
+                dtype=dtype,
+                shards=shards,
+                replicas=[ParameterReplicaMeta(shards=shards)],
+            )
+            params_meta_list.append(param)
+
+            # Log for key parameters
+            if "embed_tokens" in name or "lm_head" in name or "qkv_proj" in name or ("experts" in name and "layers.0." in name):
+                logger.info(
+                    f"[COLOCATE_INFER] {name}: sharding_type={sharding_type.name}, "
+                    f"num_shards={num_shards}, local_shape={local_shape}, "
+                    f"global_shape={global_shape}"
+                )
+
+        total_shards = sum(len(p.replicas[0].shards) for p in params_meta_list)
+        logger.info(
+            f"[COLOCATE] Built {len(params_meta_list)} parameters with {total_shards} total shards "
+            f"(inferred from single rank)"
+        )
+
+        return params_meta_list
 
     @staticmethod
     def _get_model_param_info(

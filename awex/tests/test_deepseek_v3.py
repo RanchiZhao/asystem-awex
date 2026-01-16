@@ -618,5 +618,357 @@ def test_fp8_quantization_ue8m0_format():
     assert is_power_of_2, "UE8M0 scales should be powers of 2"
 
 
+# ----------------------
+# TEST: DP Attention Mode Sharding
+# ----------------------
+
+
+def test_dp_attention_sharding_shared_experts():
+    """Test that shared_experts use attn_tp_size in DP attention mode WITHOUT deepep.
+
+    In DeepSeek-V3 with DP attention and moe_a2a_backend="none":
+    - tp_size=64, attn_tp_size=8, ep_size=64
+    - shared_experts should be sharded like dense layers (attn_tp_size=8)
+    - Regular experts use EP sharding (ep_size=64)
+
+    Note: When using deepep/mooncake backend, shared_experts are NOT sharded.
+    See test_deepep_sharding_shared_experts for that case.
+    """
+    from awex.models.deepseek_v3 import DeepSeekV3ShardingStrategy
+
+    rank_info = make_rank_info(
+        tp_size=64,
+        attn_tp_size=8,
+        ep_size=64,
+        ep_tp_size=1,
+    )
+
+    strategy = DeepSeekV3ShardingStrategy(
+        engine_name="sglang",
+        enable_dp_attention=True,
+        enable_dp_lm_head=True,
+        moe_dense_tp_size=1,
+        tp_size=64,
+        ep_size=64,
+        ep_tp_size=1,
+        rank_info=rank_info,
+        moe_a2a_backend="none",  # No deepep, so shared_experts are TP-sharded
+    )
+
+    # shared_experts should use DP_TP_SHARDING with attn_tp_size=8
+    for param_name in [
+        "model.layers.10.mlp.shared_experts.gate_proj.weight",
+        "model.layers.10.mlp.shared_experts.up_proj.weight",
+        "model.layers.10.mlp.shared_experts.down_proj.weight",
+    ]:
+        sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy(param_name)
+        assert sharding_type == ShardingType.DP_TP_SHARDING, \
+            f"{param_name}: expected DP_TP_SHARDING, got {sharding_type}"
+        assert num_shards == 8, \
+            f"{param_name}: expected num_shards=8 (attn_tp_size), got {num_shards}"
+
+
+def test_deepep_sharding_shared_experts():
+    """Test that shared_experts are NOT sharded when using deepep/mooncake backend.
+
+    In SGLang with deepep/mooncake backend, shared_experts use tp_size=1 (not TP-sharded).
+    This is because SGLang creates shared_experts with dict(tp_rank=0, tp_size=1) when
+    using deepep/mooncake (see deepseek_v2.py:692-706 in SGLang).
+
+    This is the typical colocate mode configuration:
+    - tp_size=64, attn_tp_size=8, ep_size=64
+    - moe_a2a_backend="deepep"
+    - shared_experts: NO_SHARDING (tp_size=1, fully replicated)
+    """
+    from awex.models.deepseek_v3 import DeepSeekV3ShardingStrategy
+
+    rank_info = make_rank_info(
+        tp_size=64,
+        attn_tp_size=8,
+        ep_size=64,
+        ep_tp_size=1,
+    )
+
+    strategy = DeepSeekV3ShardingStrategy(
+        engine_name="sglang",
+        enable_dp_attention=True,
+        enable_dp_lm_head=True,
+        moe_dense_tp_size=1,
+        tp_size=64,
+        ep_size=64,
+        ep_tp_size=1,
+        rank_info=rank_info,
+        moe_a2a_backend="deepep",  # With deepep, shared_experts are NOT TP-sharded
+    )
+
+    # shared_experts should use NO_SHARDING (fully replicated)
+    for param_name in [
+        "model.layers.10.mlp.shared_experts.gate_proj.weight",
+        "model.layers.10.mlp.shared_experts.up_proj.weight",
+        "model.layers.10.mlp.shared_experts.down_proj.weight",
+    ]:
+        sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy(param_name)
+        assert sharding_type == ShardingType.NO_SHARDING, \
+            f"{param_name}: expected NO_SHARDING with deepep, got {sharding_type}"
+        assert num_shards == 1, \
+            f"{param_name}: expected num_shards=1 (no sharding), got {num_shards}"
+
+
+def test_dp_attention_sharding_embedding_lm_head():
+    """Test that embed_tokens and lm_head use attn_tp_size in DP attention mode.
+
+    embed_tokens doesn't contain 'embedding' in its name, so it needs explicit handling.
+    """
+    from awex.models.deepseek_v3 import DeepSeekV3ShardingStrategy
+
+    rank_info = make_rank_info(
+        tp_size=64,
+        attn_tp_size=8,
+        ep_size=64,
+        ep_tp_size=1,
+    )
+
+    strategy = DeepSeekV3ShardingStrategy(
+        engine_name="sglang",
+        enable_dp_attention=True,
+        enable_dp_lm_head=True,
+        moe_dense_tp_size=1,
+        tp_size=64,
+        ep_size=64,
+        ep_tp_size=1,
+        rank_info=rank_info,
+    )
+
+    # embed_tokens: NO_SHARDING when enable_dp_attention=True
+    # (SGLang's VocabParallelEmbedding uses enable_tp=not is_dp_attention_enabled())
+    sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy("model.embed_tokens.weight")
+    assert sharding_type == ShardingType.NO_SHARDING, \
+        f"embed_tokens: expected NO_SHARDING, got {sharding_type}"
+    assert num_shards == 1, \
+        f"embed_tokens: expected num_shards=1, got {num_shards}"
+
+    # lm_head: DP_TP_SHARDING with attn_tp_size=8 when enable_dp_lm_head=True
+    # (SGLang's ParallelLMHead uses use_attn_tp_group=enable_dp_lm_head)
+    sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy("lm_head.weight")
+    assert sharding_type == ShardingType.DP_TP_SHARDING, \
+        f"lm_head: expected DP_TP_SHARDING, got {sharding_type}"
+    assert num_shards == 8, \
+        f"lm_head: expected num_shards=8 (attn_tp_size), got {num_shards}"
+
+
+def test_dp_attention_sharding_regular_experts():
+    """Test that regular MoE experts still use EP_SHARDING in DP attention mode."""
+    from awex.models.deepseek_v3 import DeepSeekV3ShardingStrategy
+
+    rank_info = make_rank_info(
+        tp_size=64,
+        attn_tp_size=8,
+        ep_size=64,
+        ep_tp_size=1,
+    )
+
+    strategy = DeepSeekV3ShardingStrategy(
+        engine_name="sglang",
+        enable_dp_attention=True,
+        enable_dp_lm_head=True,
+        moe_dense_tp_size=1,
+        tp_size=64,
+        ep_size=64,
+        ep_tp_size=1,
+        rank_info=rank_info,
+    )
+
+    # Regular experts should use EP_SHARDING with ep_size=64
+    for param_name in [
+        "model.layers.10.mlp.experts.w13_weight",
+        "model.layers.10.mlp.experts.w2_weight",
+    ]:
+        sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy(param_name)
+        assert sharding_type == ShardingType.EP_SHARDING, \
+            f"{param_name}: expected EP_SHARDING, got {sharding_type}"
+        assert num_shards == 64, \
+            f"{param_name}: expected num_shards=64 (ep_size), got {num_shards}"
+
+
+def test_mcore_sharding_shared_experts():
+    """Test that shared_experts use TP_SHARDING with tp_size in training (mcore) mode.
+
+    In training (mcore) mode:
+    - enable_dp_attention=False (always)
+    - shared_experts should use TP_SHARDING with tp_size (e.g., 8)
+    - NOT EP_SHARDING like regular MoE experts
+    """
+    from awex.models.deepseek_v3 import DeepSeekV3ShardingStrategy
+
+    # Training setup: TP=8, PP=4, CP=4, EP=32
+    rank_info = make_rank_info(
+        tp_size=8,
+        attn_tp_size=8,  # Same as tp_size for training
+        ep_size=32,
+        ep_tp_size=1,
+    )
+
+    strategy = DeepSeekV3ShardingStrategy(
+        engine_name="mcore",
+        enable_dp_attention=False,  # Always False for training
+        enable_dp_lm_head=False,
+        moe_dense_tp_size=8,
+        tp_size=8,
+        ep_size=32,
+        ep_tp_size=1,
+        rank_info=rank_info,
+    )
+
+    # shared_experts should use TP_SHARDING with tp_size=8
+    for param_name in [
+        "model.layers.10.mlp.shared_experts.gate_proj.weight",
+        "model.layers.10.mlp.shared_experts.up_proj.weight",
+        "model.layers.10.mlp.shared_experts.down_proj.weight",
+    ]:
+        sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy(param_name)
+        assert sharding_type == ShardingType.TP_SHARDING, \
+            f"{param_name}: expected TP_SHARDING, got {sharding_type}"
+        assert num_shards == 8, \
+            f"{param_name}: expected num_shards=8 (tp_size), got {num_shards}"
+
+
+def test_dense_layer_mlp_sharding_with_deepep():
+    """Test that Dense layer MLP (first 3 layers) use NO_SHARDING when moe_dense_tp_size=1.
+
+    In SGLang with moe_dense_tp_size=1 (enable_moe_dense_fully_dp=True):
+    - Dense layer MLP is fully replicated (tp_size=1)
+    - This applies to layers 0, 1, 2 (first_k_dense_replace=3)
+
+    This is the typical colocate mode configuration:
+    - tp_size=64, attn_tp_size=8, ep_size=64
+    - moe_dense_tp_size=1
+    - Dense layer MLP: NO_SHARDING (fully replicated)
+    """
+    from awex.models.deepseek_v3 import DeepSeekV3ShardingStrategy
+
+    rank_info = make_rank_info(
+        tp_size=64,
+        attn_tp_size=8,
+        ep_size=64,
+        ep_tp_size=1,
+    )
+
+    strategy = DeepSeekV3ShardingStrategy(
+        engine_name="sglang",
+        enable_dp_attention=True,
+        enable_dp_lm_head=True,
+        moe_dense_tp_size=1,  # Dense layers are fully replicated
+        tp_size=64,
+        ep_size=64,
+        ep_tp_size=1,
+        rank_info=rank_info,
+        moe_a2a_backend="deepep",
+    )
+
+    # Dense layer MLP (layers 0, 1, 2) should use NO_SHARDING
+    for layer_id in [0, 1, 2]:
+        for param_name in [
+            f"model.layers.{layer_id}.mlp.gate_proj.weight",
+            f"model.layers.{layer_id}.mlp.up_proj.weight",
+            f"model.layers.{layer_id}.mlp.down_proj.weight",
+            f"model.layers.{layer_id}.mlp.gate_proj.weight_scale_inv",  # FP8 scale too
+            f"model.layers.{layer_id}.mlp.down_proj.weight_scale_inv",
+        ]:
+            sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy(param_name)
+            assert sharding_type == ShardingType.NO_SHARDING, \
+                f"{param_name}: expected NO_SHARDING for dense layer MLP with moe_dense_tp_size=1, got {sharding_type}"
+            assert num_shards == 1, \
+                f"{param_name}: expected num_shards=1, got {num_shards}"
+
+
+def test_moe_layer_mlp_not_affected_by_dense_sharding():
+    """Test that MoE layer MLP (layer >= 3) is NOT affected by moe_dense_tp_size.
+
+    MoE layers (layer_id >= first_k_dense_replace=3) should use their own sharding
+    strategy, not the dense layer strategy. Even with moe_dense_tp_size=1, MoE layers
+    should use EP sharding for experts.
+    """
+    from awex.models.deepseek_v3 import DeepSeekV3ShardingStrategy
+
+    rank_info = make_rank_info(
+        tp_size=64,
+        attn_tp_size=8,
+        ep_size=64,
+        ep_tp_size=1,
+    )
+
+    strategy = DeepSeekV3ShardingStrategy(
+        engine_name="sglang",
+        enable_dp_attention=True,
+        enable_dp_lm_head=True,
+        moe_dense_tp_size=1,
+        tp_size=64,
+        ep_size=64,
+        ep_tp_size=1,
+        rank_info=rank_info,
+        moe_a2a_backend="deepep",
+    )
+
+    # MoE layer experts (layer 10) should use EP_SHARDING, not be affected by moe_dense_tp_size
+    for param_name in [
+        "model.layers.10.mlp.experts.w13_weight",
+        "model.layers.10.mlp.experts.w2_weight",
+    ]:
+        sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy(param_name)
+        assert sharding_type == ShardingType.EP_SHARDING, \
+            f"{param_name}: expected EP_SHARDING for MoE experts, got {sharding_type}"
+        assert num_shards == 64, \
+            f"{param_name}: expected num_shards=64 (ep_size), got {num_shards}"
+
+    # MoE layer shared_experts (layer 10) should use NO_SHARDING with deepep
+    for param_name in [
+        "model.layers.10.mlp.shared_experts.gate_proj.weight",
+        "model.layers.10.mlp.shared_experts.up_proj.weight",
+    ]:
+        sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy(param_name)
+        assert sharding_type == ShardingType.NO_SHARDING, \
+            f"{param_name}: expected NO_SHARDING for shared_experts with deepep, got {sharding_type}"
+
+
+def test_mcore_dense_layer_uses_tp_sharding():
+    """Test that Dense layer MLP uses TP_SHARDING in training (mcore) mode.
+
+    In training (mcore) mode, moe_dense_tp_size equals tp_size, so dense layers
+    use regular TP sharding.
+    """
+    from awex.models.deepseek_v3 import DeepSeekV3ShardingStrategy
+
+    rank_info = make_rank_info(
+        tp_size=8,
+        attn_tp_size=8,
+        ep_size=32,
+        ep_tp_size=1,
+    )
+
+    strategy = DeepSeekV3ShardingStrategy(
+        engine_name="mcore",
+        enable_dp_attention=False,
+        enable_dp_lm_head=False,
+        moe_dense_tp_size=8,  # Same as tp_size for training
+        tp_size=8,
+        ep_size=32,
+        ep_tp_size=1,
+        rank_info=rank_info,
+    )
+
+    # Dense layer MLP (layer 0, 1, 2) should use TP_SHARDING in mcore mode
+    for layer_id in [0, 1, 2]:
+        for param_name in [
+            f"model.layers.{layer_id}.mlp.gate_proj.weight",
+            f"model.layers.{layer_id}.mlp.up_proj.weight",
+            f"model.layers.{layer_id}.mlp.down_proj.weight",
+        ]:
+            sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy(param_name)
+            assert sharding_type == ShardingType.TP_SHARDING, \
+                f"{param_name}: expected TP_SHARDING for mcore dense layer, got {sharding_type}"
+            assert num_shards == 8, \
+                f"{param_name}: expected num_shards=8 (tp_size), got {num_shards}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

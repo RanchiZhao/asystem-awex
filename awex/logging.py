@@ -52,7 +52,7 @@ class Logger:
         return f"{timestamp}\t{level_name} {filename}:{lineno} -- {process_id} -- {message}"
 
     def _log(self, level: LogLevel, level_name: str, message: str, *args, **kwargs):
-        """Internal log method that prints directly to stdout."""
+        """Internal log method that prints directly to stdout/stderr."""
         if level < self.level:
             return
 
@@ -75,7 +75,9 @@ class Logger:
                 pass
 
         formatted = self._format_message(level_name, message, frame_info)
-        print(formatted, flush=True, file=sys.stdout)
+        # Send ERROR and CRITICAL to stderr for better Ray visibility
+        output_stream = sys.stderr if level >= LogLevel.ERROR else sys.stdout
+        print(formatted, flush=True, file=output_stream)
 
     def debug(self, message: str, *args, **kwargs):
         """Log debug message."""

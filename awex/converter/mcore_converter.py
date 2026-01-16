@@ -74,6 +74,8 @@ class McoreToHFWeightConverter:
         self.hf_config = hf_config
         self.rank_info = rank_info
         self.infer_conf = infer_conf
+        # Get original vocab_size for padding removal
+        self.vocab_size = getattr(hf_config, "vocab_size", None)
         self.router_dtype = infer_conf.get("router_dtype", "bf16")
         if self.router_dtype == "bf16":
             self.router_dtype = torch.bfloat16
@@ -271,9 +273,33 @@ class McoreToHFWeightConverter:
     def _fuse_gate_up_proj(self, name: str) -> bool:
         return False
 
+    def _remove_vocab_padding(
+        self, name: str, parameter: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Remove Megatron's vocab padding from embedding/lm_head weights.
+
+        Megatron pads vocab_size to be divisible by (make_vocab_size_divisible_by * tp_size),
+        typically 128 * 8 = 1024. This causes a mismatch with HF's original vocab_size.
+
+        For DeepSeek-V3: original=129280, padded=130048, diff=768
+
+        This mirrors Slime's remove_padding() logic to ensure consistency.
+        """
+        if self.vocab_size is None:
+            return parameter
+
+        # Only remove padding for embedding and output layers
+        if parameter.shape[0] > self.vocab_size:
+            # Parameter is padded, slice to original vocab_size
+            return parameter[:self.vocab_size]
+        return parameter
+
     def _convert_lm_head_param(
         self, name: str, parameter: torch.Tensor
     ) -> List[Tuple[str, torch.Tensor]]:
+        # Remove vocab padding first
+        parameter = self._remove_vocab_padding(name, parameter)
         if getattr(self.hf_config, "norm_head", False):
             import torch.nn.functional as F
 
@@ -291,7 +317,11 @@ class McoreToHFWeightConverter:
             "decoder.final_layernorm.weight": "model.norm.weight",
         }
         if name in direct_name_mapping:
-            return [(direct_name_mapping[name], parameter)]
+            hf_name = direct_name_mapping[name]
+            # Remove vocab padding for embedding weights
+            if "word_embeddings" in name:
+                parameter = self._remove_vocab_padding(name, parameter)
+            return [(hf_name, parameter)]
         if "output_layer.weight" in name:
             return self._convert_lm_head_param(name, parameter)
         name = name.replace("decoder.layers.", "")

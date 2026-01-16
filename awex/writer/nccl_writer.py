@@ -306,7 +306,14 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
 
         # Wait for inference engines to finish processing
         update_finished_key = f"weights_update_finished{key_suffix}"
+        logger.info(
+            f"[Writer Rank {self.transfer_rank}] Waiting for inference engines to finish "
+            f"(key={update_finished_key}, timeout={self.timeout}s, step_id={step_id})"
+        )
         self.meta_server_client.get_object(update_finished_key, timeout=self.timeout)
+        logger.info(
+            f"[Writer Rank {self.transfer_rank}] Received completion signal from inference engines (step_id={step_id})"
+        )
         t7 = time.time()
         wait_time = t7 - t6
         logger.info(f"[PROFILE] train_rank={self.transfer_rank} step={step_id} wait_inference: {wait_time:.3f}s")

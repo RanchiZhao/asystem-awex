@@ -134,7 +134,8 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
         logger.info(f"Got inference config from meta server: {self.infer_conf}")
         self.infer_engine_config = self.infer_conf["infer_engine_config"]
         self.infer_world_size = self.infer_conf["infer_world_size"]
-        self.rank_info = get_rank_info_extractor(self.engine_name)()
+        # 计算有问题
+        self.rank_info = get_rank_info_extractor(self.engine_name)() 
         logger.info(f"Writer rank info: {self.rank_info}")
         self.training_world_size = self.rank_info.world_size
         self.transfer_world_size = self.infer_world_size + self.training_world_size
@@ -215,6 +216,7 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
             self.infer_conf,
         )
         logger.info("Start to get number of inference engines from meta server")
+        # 卡住
         self.num_infer_engines = self.meta_server_client.get_object(
             "num_infer_engines", timeout=self.timeout
         )
@@ -242,28 +244,40 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
 
     @torch.no_grad()
     def write_weights(self, step_id, **kwargs):
+        rank = dist.get_rank() if dist.is_initialized() else 0
         with self.lock:
             logger.info(
-                f"Start to write weights for step {step_id}, current thread {threading.current_thread()}"
+                f"[Writer Rank {rank}] Start to write weights for step {step_id}, current thread {threading.current_thread()}"
             )
             try:
                 if self.enable_colocate_mode:
+                    logger.info(f"[Writer Rank {rank}] Calling _release_memory_for_weights_exchange()")
                     self._release_memory_for_weights_exchange()
+                    logger.info(f"[Writer Rank {rank}] Returned from _release_memory_for_weights_exchange()")
                 if not self.initialized:
-                    logger.info("Start to initialize weights exchange sharding writer")
+                    logger.info(f"[Writer Rank {rank}] Start to initialize weights exchange sharding writer")
                     self._initialize()
                     self.initialized = True
                     logger.info(
-                        "Finished initializing weights exchange sharding writer"
+                        f"[Writer Rank {rank}] Finished initializing weights exchange sharding writer"
                     )
+                logger.info(f"[Writer Rank {rank}] Calling _validate_weights(step_id={step_id})")
                 self._validate_weights(step_id, **kwargs)
+                logger.info(f"[Writer Rank {rank}] Returned from _validate_weights()")
                 start_time = time.time()
                 if self.enable_colocate_mode:
+                    logger.info(f"[Writer Rank {rank}] Resuming memory occupation for weights")
                     self.train_engine.resume_memory_occupation(tags=["weights"])
+                    logger.info(f"[Writer Rank {rank}] About to call _write_weights_in_colocate_mode(step_id={step_id})")
                     self._write_weights_in_colocate_mode(step_id, **kwargs)
+                    logger.info(f"[Writer Rank {rank}] Returned from _write_weights_in_colocate_mode()")
                 else:
+                    logger.info(f"[Writer Rank {rank}] About to call _write_weights(step_id={step_id})")
                     self._write_weights(step_id, **kwargs)
+                    logger.info(f"[Writer Rank {rank}] Returned from _write_weights()")
+                logger.info(f"[Writer Rank {rank}] About to call _finish_weights_update()")
                 self._finish_weights_update()
+                logger.info(f"[Writer Rank {rank}] Returned from _finish_weights_update()")
                 duration = time.time() - start_time
                 compute_statistics(
                     self._history_write_weights_time, step_id, duration, "Write weights"

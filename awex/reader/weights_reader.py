@@ -175,14 +175,21 @@ class WeightsReader(WeightExchangeReader):
             # In DeepSeek-V3: tp_size=64 across 8 nodes, each node has 8 GPUs
             gpus_per_node = int(os.environ.get("NPROC_PER_NODE", 8))
             nnodes = max(1, self.tp_size // gpus_per_node)
-            actual_num_engines = max(1, self.num_engines // nnodes)
+            actual_num_engines = max(1, self.num_engines // nnodes) 
+            # [COLOCATE] Calculated actual_num_engines=2 (num_engines=16, nnodes=8, gpus_per_node=8)
             logger.info(
                 f"[COLOCATE] Calculated actual_num_engines={actual_num_engines} "
                 f"(num_engines={self.num_engines}, nnodes={nnodes}, gpus_per_node={gpus_per_node})"
             )
         else:
             actual_num_engines = self.num_engines
+        logger.info(
+            f"[WeightsReader] Engine rank {self.engine_rank} putting num_infer_engines={actual_num_engines} to MetaServer"
+        )
         self.meta_server_client.put_object("num_infer_engines", actual_num_engines)
+        logger.info(
+            f"[WeightsReader] Engine rank {self.engine_rank} successfully put num_infer_engines={actual_num_engines} to MetaServer"
+        )
         # NOTE: In colocate mode with TP spanning multiple nodes, we CANNOT call
         # release_memory_occupation here because:
         # 1. Only node_rank=0 workers call WeightsReader.initialize()

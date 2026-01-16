@@ -57,6 +57,13 @@ class McoreParamMetaResolver(ParamMetaResolver):
             self._model_arch_name,
             self._rank_info,
         )
+        # Debug logging
+        logger.info(
+            f"[TRAIN_META_DEBUG] model_arch_name={self._model_arch_name}, "
+            f"strategy_class={type(self._sharding_strategy).__name__}, "
+            f"tp_size={self._rank_info.tp_size}, ep_size={self._rank_info.ep_size}, "
+            f"attn_tp_size={self._rank_info.attn_tp_size}"
+        )
         rank = self._rank_info.global_rank
         self._infer_conf = infer_conf
         self.infer_hf_config = infer_conf["hf_config"]

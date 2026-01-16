@@ -125,16 +125,21 @@ class ShardingStrategy:
         ep_size,
         ep_tp_size,
         rank_info: RankInfo,
+        moe_a2a_backend: str = "none",
         **kwargs,
     ) -> None:
         self.engine_name = engine_name
-        self.enable_dp_attention = enable_dp_attention
-        self.enable_dp_lm_head = enable_dp_lm_head
-        self.moe_dense_tp_size = moe_dense_tp_size
+        # Ensure boolean flags are never None (safety check)
+        self.enable_dp_attention = bool(enable_dp_attention) if enable_dp_attention is not None else False
+        self.enable_dp_lm_head = bool(enable_dp_lm_head) if enable_dp_lm_head is not None else False
+        self.moe_dense_tp_size = moe_dense_tp_size or 1
         self.tp_size = tp_size
-        self.ep_size = ep_size
-        self.ep_tp_size = ep_tp_size
+        self.ep_size = ep_size or 1
+        self.ep_tp_size = ep_tp_size or 1
         self.rank_info = rank_info
+        # MoE A2A backend: "none", "deepep", "mooncake", "ascend_fuseep"
+        # When using deepep/mooncake, shared_experts are NOT TP-sharded in SGLang
+        self.moe_a2a_backend = moe_a2a_backend or "none"
 
     def get_attention_sharding_strategy(self, parameter_name, **kwargs):
         """

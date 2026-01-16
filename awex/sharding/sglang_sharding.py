@@ -24,18 +24,48 @@ def get_sglang_sharding_strategy(
     """
     Get the sharding strategy class for a given model architecture name.
     """
+    from awex import logging
     from awex.models import get_sharding_strategy
 
+    logger = logging.getLogger(__name__)
+
     cls = get_sharding_strategy(model_name)
+
+    # Debug: log the config object type and attributes
+    config_type = type(infer_engine_config).__name__
+    raw_dp_attention = getattr(infer_engine_config, "enable_dp_attention", "ATTR_NOT_FOUND")
+    raw_dp_lm_head = getattr(infer_engine_config, "enable_dp_lm_head", "ATTR_NOT_FOUND")
+    logger.info(
+        f"[SHARDING_DEBUG] Config type: {config_type}, "
+        f"raw enable_dp_attention={raw_dp_attention}, raw enable_dp_lm_head={raw_dp_lm_head}"
+    )
+
+    # Safely get config values with defaults (some configs may have None values)
+    enable_dp_attention = getattr(infer_engine_config, "enable_dp_attention", False) or False
+    enable_dp_lm_head = getattr(infer_engine_config, "enable_dp_lm_head", False) or False
+    moe_dense_tp_size = getattr(infer_engine_config, "moe_dense_tp_size", 1) or 1
+    ep_size = getattr(infer_engine_config, "ep_size", 1) or 1
+    # MoE A2A backend determines shared_experts TP behavior in SGLang
+    # When using deepep/mooncake, shared_experts are NOT TP-sharded
+    moe_a2a_backend = getattr(infer_engine_config, "moe_a2a_backend", "none") or "none"
+
+    logger.info(
+        f"[SHARDING] Creating sharding strategy for {model_name}: "
+        f"enable_dp_attention={enable_dp_attention}, enable_dp_lm_head={enable_dp_lm_head}, "
+        f"tp_size={rank_info.tp_size}, attn_tp_size={rank_info.attn_tp_size}, ep_size={ep_size}, "
+        f"moe_a2a_backend={moe_a2a_backend}"
+    )
+
     return cls(
         engine_name="sglang",
-        enable_dp_attention=infer_engine_config.enable_dp_attention,
-        enable_dp_lm_head=infer_engine_config.enable_dp_lm_head,
-        moe_dense_tp_size=infer_engine_config.moe_dense_tp_size,
+        enable_dp_attention=enable_dp_attention,
+        enable_dp_lm_head=enable_dp_lm_head,
+        moe_dense_tp_size=moe_dense_tp_size,
         tp_size=rank_info.tp_size,
-        ep_size=infer_engine_config.ep_size,
+        ep_size=ep_size,
         ep_tp_size=rank_info.ep_tp_size,
         rank_info=rank_info,
+        moe_a2a_backend=moe_a2a_backend,
         **kwargs,
     )
 

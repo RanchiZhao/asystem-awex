@@ -117,6 +117,13 @@ class ParamMetaResolver(ABC):
         for name, shards in param_shards.items():
             sharding_type, sharding_dim, num_shards = param_sharding_info[name]
 
+            # Debug logging for shared_experts (all layers)
+            if "shared_experts" in name and "up_proj.weight" in name and "scale" not in name:
+                logger.info(
+                    f"[BUILD_META_DEBUG] {name}: sharding_type={sharding_type.name}, "
+                    f"sharding_dim={sharding_dim}, num_shards={num_shards}, total_shards={len(shards)}"
+                )
+
             if sharding_type == ShardingType.NO_SHARDING:
                 # FIX: For NO_SHARDING, each rank should be its own replica with one shard
                 replicas[name] = [[shard] for shard in shards]
@@ -178,6 +185,15 @@ class ParamMetaResolver(ABC):
                 for i in range(num_dims)
             )
             global_numel = sum(shard.numel for shard in first_replica)
+
+            # Debug logging for shared_experts global_shape calculation
+            if "shared_experts" in name and "up_proj.weight" in name and "scale" not in name:
+                logger.info(
+                    f"[GLOBAL_SHAPE_DEBUG] {name}: "
+                    f"num_replicas={len(replicas[name])}, first_replica_shards={len(first_replica)}, "
+                    f"sharding_dim={sharding_dim}, global_shape={global_shape}, "
+                    f"first_shard_shape={first_replica[0].shape if first_replica else None}"
+                )
             # Compute global offsets per replica, not across all shards
             for replica in replicas[name]:
                 prev_offsets = [0] * num_dims

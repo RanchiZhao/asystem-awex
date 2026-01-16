@@ -76,7 +76,66 @@ def get_mla_sharding_dim(param_name: str) -> int:
 class DeepSeekV3ShardingStrategy(ShardingStrategy):
     """
     Custom sharding strategy for DeepSeek-V3 with MLA (Multi-head Latent Attention).
+
+    DeepSeek-V3 with DP attention has special sharding requirements:
+    - Attention params: Use attn_tp_size (not tp_size)
+    - Shared experts: Use attn_tp_size (not ep_size) - they're TP-sharded like dense layers
+    - Embedding/LM head: Use attn_tp_size (not tp_size)
+    - Dense layer MLP (first k layers): When moe_dense_tp_size=1, use NO_SHARDING
     """
+
+    # DeepSeek-V3 uses first 3 layers as dense (no MoE)
+    # This is configurable via first_k_dense_replace in HF config, default is 3
+    FIRST_K_DENSE_REPLACE = 3
+
+    def _extract_layer_id(self, parameter_name: str) -> int:
+        """Extract layer ID from parameter name like 'model.layers.5.mlp.gate_proj.weight'."""
+        import re
+        match = re.search(r"layers\.(\d+)\.", parameter_name)
+        if match:
+            return int(match.group(1))
+        return -1
+
+    def _is_dense_layer(self, parameter_name: str) -> bool:
+        """Check if parameter belongs to a dense layer (first k layers without MoE)."""
+        layer_id = self._extract_layer_id(parameter_name)
+        return 0 <= layer_id < self.FIRST_K_DENSE_REPLACE
+
+    def get_dense_layer_mlp_sharding_strategy(self, parameter_name, **kwargs):
+        """
+        Determine sharding strategy for Dense layer MLP (first k layers without MoE).
+
+        In SGLang with moe_dense_tp_size=1, dense layer MLP is fully replicated (NO_SHARDING).
+        This is controlled by enable_moe_dense_fully_dp() in SGLang.
+        """
+        sharding_dim = get_default_sharding_dim(parameter_name)
+
+        logger.info(
+            f"[DS_V3_DENSE_MLP_DEBUG] {parameter_name}: "
+            f"engine={self.engine_name}, moe_dense_tp_size={self.moe_dense_tp_size}, "
+            f"tp_size={self.rank_info.tp_size}"
+        )
+
+        # SGLang with moe_dense_tp_size=1: dense layer MLP is fully replicated
+        if self.engine_name == "sglang" and self.moe_dense_tp_size == 1:
+            logger.info(
+                f"[DS_V3_DENSE_MLP_DEBUG] {parameter_name}: -> NO_SHARDING "
+                f"(moe_dense_tp_size=1, dense MLP fully replicated)"
+            )
+            return ShardingType.NO_SHARDING, sharding_dim, 1
+
+        # Otherwise, use standard TP sharding
+        tp_size = self.rank_info.tp_size
+        if tp_size > 1:
+            logger.info(
+                f"[DS_V3_DENSE_MLP_DEBUG] {parameter_name}: -> TP_SHARDING, dim={sharding_dim}, num_shards={tp_size}"
+            )
+            return ShardingType.TP_SHARDING, sharding_dim, tp_size
+        else:
+            logger.info(
+                f"[DS_V3_DENSE_MLP_DEBUG] {parameter_name}: -> NO_SHARDING (tp_size=1)"
+            )
+            return ShardingType.NO_SHARDING, sharding_dim, 1
 
     def get_attention_sharding_strategy(self, parameter_name, **kwargs):
         """
@@ -101,6 +160,61 @@ class DeepSeekV3ShardingStrategy(ShardingStrategy):
             else:
                 return ShardingType.NO_SHARDING, sharding_dim, 1
 
+    def get_shared_expert_sharding_strategy(self, parameter_name, **kwargs):
+        """
+        Override for DeepSeek-V3: Shared experts use TP sharding (like attention),
+        NOT EP sharding (like regular MoE experts).
+
+        IMPORTANT: In SGLang with deepep/mooncake backend, shared_experts are NOT TP-sharded!
+        They use tp_size=1 (fully replicated). See deepseek_v2.py:692-706 in SGLang.
+
+        In DP attention mode WITHOUT deepep/mooncake, shared experts are sharded across attn_tp_size.
+        """
+        sharding_dim = get_default_sharding_dim(parameter_name)
+
+        # Debug logging
+        logger.info(
+            f"[DS_V3_SHARED_EXPERT_DEBUG] {parameter_name}: "
+            f"engine={self.engine_name}, enable_dp_attention={self.enable_dp_attention}, "
+            f"tp_size={self.rank_info.tp_size}, attn_tp_size={self.rank_info.attn_tp_size}, "
+            f"moe_a2a_backend={self.moe_a2a_backend}"
+        )
+
+        # SGLang with deepep/mooncake: shared_experts are NOT TP-sharded (tp_size=1)
+        # This matches the behavior in SGLang's deepseek_v2.py where shared_experts
+        # are created with dict(tp_rank=0, tp_size=1) when using deepep/mooncake
+        if self.engine_name == "sglang" and self.moe_a2a_backend in ["deepep", "mooncake"]:
+            logger.info(
+                f"[DS_V3_SHARED_EXPERT_DEBUG] {parameter_name}: -> NO_SHARDING "
+                f"(moe_a2a_backend={self.moe_a2a_backend}, shared_experts not TP-sharded)"
+            )
+            return ShardingType.NO_SHARDING, sharding_dim, 1
+
+        if self.enable_dp_attention:
+            attn_tp_size = self.rank_info.attn_tp_size
+            if attn_tp_size > 1:
+                logger.info(
+                    f"[DS_V3_SHARED_EXPERT_DEBUG] {parameter_name}: -> DP_TP_SHARDING, dim={sharding_dim}, num_shards={attn_tp_size}"
+                )
+                return ShardingType.DP_TP_SHARDING, sharding_dim, attn_tp_size
+            else:
+                logger.info(
+                    f"[DS_V3_SHARED_EXPERT_DEBUG] {parameter_name}: -> NO_SHARDING (attn_tp_size={attn_tp_size})"
+                )
+                return ShardingType.NO_SHARDING, sharding_dim, 1
+        else:
+            tp_size = self.rank_info.tp_size
+            if tp_size > 1:
+                logger.info(
+                    f"[DS_V3_SHARED_EXPERT_DEBUG] {parameter_name}: -> TP_SHARDING, dim={sharding_dim}, num_shards={tp_size}"
+                )
+                return ShardingType.TP_SHARDING, sharding_dim, tp_size
+            else:
+                logger.info(
+                    f"[DS_V3_SHARED_EXPERT_DEBUG] {parameter_name}: -> NO_SHARDING (tp_size={tp_size})"
+                )
+                return ShardingType.NO_SHARDING, sharding_dim, 1
+
     def get_sharding_strategy(self, parameter_name, **kwargs):
         """
         Main entry point to determine sharding strategy.
@@ -116,7 +230,63 @@ class DeepSeekV3ShardingStrategy(ShardingStrategy):
         if "e_score_correction_bias" in parameter_name:
             return ShardingType.NO_SHARDING, 0, 1
 
-        # Fall back to parent implementation
+        # Embedding (embed_tokens): In DP attention mode, embed_tokens is REPLICATED (enable_tp=False)
+        # So it should use NO_SHARDING, not attn_tp sharding!
+        if "embed_tokens" in parameter_name:
+            if self.enable_dp_attention:
+                # SGLang's VocabParallelEmbedding uses enable_tp=not is_dp_attention_enabled()
+                # So when enable_dp_attention=True, embed_tokens is replicated (no TP)
+                logger.info(
+                    f"[DS_V3_SHARDING] {parameter_name}: embed_tokens with dp_attention=True -> NO_SHARDING"
+                )
+                return ShardingType.NO_SHARDING, 0, 1
+            else:
+                # Normal TP sharding
+                tp_size = self.rank_info.tp_size
+                if tp_size > 1:
+                    return ShardingType.TP_SHARDING, 0, tp_size
+                return ShardingType.NO_SHARDING, 0, 1
+
+        # LM head: Uses attn_tp group when enable_dp_lm_head=True
+        if "lm_head" in parameter_name:
+            if self.enable_dp_lm_head:
+                # SGLang's ParallelLMHead uses use_attn_tp_group=enable_dp_lm_head
+                attn_tp_size = self.rank_info.attn_tp_size
+                if attn_tp_size > 1:
+                    logger.info(
+                        f"[DS_V3_SHARDING] {parameter_name}: lm_head with dp_lm_head=True -> DP_TP_SHARDING, attn_tp_size={attn_tp_size}"
+                    )
+                    return ShardingType.DP_TP_SHARDING, 0, attn_tp_size
+                return ShardingType.NO_SHARDING, 0, 1
+            else:
+                # Normal TP sharding
+                tp_size = self.rank_info.tp_size
+                if tp_size > 1:
+                    return ShardingType.TP_SHARDING, 0, tp_size
+                return ShardingType.NO_SHARDING, 0, 1
+
+        # Dense layer MLP (first k layers without MoE): special handling for moe_dense_tp_size=1
+        # Must check before shared_experts and regular experts
+        if "mlp" in parameter_name and self._is_dense_layer(parameter_name):
+            # Dense layers don't have "experts" in their param names, but let's be explicit
+            if "expert" not in parameter_name:
+                result = self.get_dense_layer_mlp_sharding_strategy(parameter_name, **kwargs)
+                logger.info(
+                    f"[DS_V3_SHARDING] {parameter_name}: dense layer MLP -> "
+                    f"{result[0].name}, dim={result[1]}, num_shards={result[2]}"
+                )
+                return result
+
+        # Shared experts: use TP sharding (NOT EP sharding like regular experts)
+        if "shared_experts" in parameter_name:
+            result = self.get_shared_expert_sharding_strategy(parameter_name, **kwargs)
+            logger.info(
+                f"[DS_V3_SHARDING] {parameter_name}: shared_experts path -> "
+                f"{result[0].name}, dim={result[1]}, num_shards={result[2]}"
+            )
+            return result
+
+        # Fall back to parent implementation for regular experts, etc.
         return super().get_sharding_strategy(parameter_name, **kwargs)
 
 

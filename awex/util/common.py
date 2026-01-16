@@ -146,6 +146,93 @@ def compute_statistics(stage_history: dict, step_id: int, duration: float, stage
     )
 
 
+def _is_acceptable_dtype_mismatch(
+    param_name: str,
+    train_dtype,
+    infer_dtype,
+) -> bool:
+    """
+    Check if a dtype mismatch is acceptable and can be handled at transfer time.
+
+    Acceptable mismatches:
+    - Router bias (e_score_correction_bias): float32 <-> bfloat16
+      Megatron may store in float32, SGLang expects bfloat16 (or vice versa)
+    """
+    # Define acceptable conversions (bidirectional)
+    ACCEPTABLE_FLOAT_CONVERSIONS = {
+        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float16),
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float16),
+        (torch.float16, torch.bfloat16),
+    }
+
+    # Router bias - dtype conversion is handled at transfer time
+    if "e_score_correction_bias" in param_name:
+        dtype_pair = (train_dtype, infer_dtype)
+        if dtype_pair in ACCEPTABLE_FLOAT_CONVERSIONS:
+            logger.info(
+                f"[DTYPE_CHECK] {param_name}: Allowing dtype mismatch "
+                f"({train_dtype} -> {infer_dtype}), will convert at transfer time"
+            )
+            return True
+
+    return False
+
+
+def _is_vocab_padding_mismatch(
+    param_name: str,
+    infer_param_meta,
+    train_param_meta,
+    hf_config=None,
+) -> bool:
+    """
+    Check if this is an embedding/lm_head parameter with vocab padding mismatch.
+
+    Megatron pads vocab_size to be divisible by (make_vocab_size_divisible_by * tp_size).
+    For example: original=129280, padded=130048 (diff=768).
+
+    This mismatch is expected and will be handled at transfer time by slicing.
+    """
+    # Only check for embedding and lm_head
+    if not any(key in param_name for key in ["embed_tokens", "lm_head", "word_embeddings"]):
+        return False
+
+    if hf_config is None:
+        return False
+
+    vocab_size = getattr(hf_config, "vocab_size", None)
+    if vocab_size is None:
+        return False
+
+    # Get the vocab dimension (dim 0 for embedding/lm_head)
+    train_vocab_dim = train_param_meta.global_shape[0]
+    infer_vocab_dim = infer_param_meta.global_shape[0]
+
+    # Check if training has more elements (padded)
+    if train_vocab_dim > infer_vocab_dim and train_vocab_dim > vocab_size:
+        # Training is padded, inference uses HF vocab_size
+        # Verify inference matches HF config
+        if infer_vocab_dim == vocab_size:
+            logger.info(
+                f"[VOCAB_PADDING] {param_name}: Allowing vocab padding mismatch "
+                f"(train={train_vocab_dim}, infer={infer_vocab_dim}, hf_config={vocab_size}), "
+                f"will slice at transfer time"
+            )
+            return True
+
+    # Also check the reverse (inference padded more than training - less common)
+    if infer_vocab_dim > train_vocab_dim:
+        # This shouldn't happen normally, but log it
+        logger.warning(
+            f"[VOCAB_PADDING] {param_name}: Unexpected - inference vocab ({infer_vocab_dim}) "
+            f"> training vocab ({train_vocab_dim})"
+        )
+
+    return False
+
+
 def _is_qkv_param_with_kv_replication(
     param_name: str,
     infer_param_meta,
@@ -212,23 +299,76 @@ def check_train_infer_params_meta(
     raise_exception: bool = False,
     hf_config=None,
 ):
+    """
+    Check consistency between training and inference parameter metadata.
+
+    Returns:
+        int: Number of errors found (0 means all checks passed)
+    """
+    error_count = 0
+    error_messages = []
+
     infer_meta = {param_meta.name: param_meta for param_meta in infer_parameters_meta}
     train_meta = {param_meta.name: param_meta for param_meta in training_params_meta}
     common_params = set(infer_meta.keys()) & set(train_meta.keys())
+
+    logger.info(
+        f"[METADATA_CHECK] Checking {len(common_params)} common parameters "
+        f"(train: {len(train_meta)}, infer: {len(infer_meta)})"
+    )
+
+    # Check for parameter count mismatch
     if len(common_params) != len(infer_meta) or len(common_params) != len(train_meta):
-        if len(train_meta) > len(infer_meta):
-            diff = set(train_meta.keys()) - common_params
-        else:
-            diff = set(infer_meta.keys()) - common_params
-        logger.error(
-            f"Inconsistent parameters meta: "
-            f"train {len(train_meta)} infer {len(infer_meta)} diff keys {diff}"
-        )
-        if raise_exception:
-            raise ValueError(
-                f"Inconsistent parameters meta for inference and training: "
-                f"{len(common_params)} {len(infer_meta)} {len(train_meta)}, diff keys {diff}"
+        train_only = set(train_meta.keys()) - common_params
+        infer_only = set(infer_meta.keys()) - common_params
+
+        # Separate params into categories
+        def categorize_param(name):
+            """Categorize param as expert, fused_mla_scale, or other."""
+            if ".experts." in name:
+                return "expert"
+            # FP8 scale params for fused MLA (fused vs split naming mismatch is expected)
+            if "weight_scale" in name and any(x in name for x in ["q_a_proj", "kv_a_proj", "fused_qkv_a_proj"]):
+                return "mla_scale"
+            return "other"
+
+        train_only_experts = {p for p in train_only if categorize_param(p) == "expert"}
+        train_only_mla_scales = {p for p in train_only if categorize_param(p) == "mla_scale"}
+        train_only_other = train_only - train_only_experts - train_only_mla_scales
+
+        infer_only_experts = {p for p in infer_only if categorize_param(p) == "expert"}
+        infer_only_mla_scales = {p for p in infer_only if categorize_param(p) == "mla_scale"}
+        infer_only_other = infer_only - infer_only_experts - infer_only_mla_scales
+
+        # Expert params mismatch is expected in colocate mode (EP sharding)
+        if train_only_experts or infer_only_experts:
+            logger.warning(
+                f"[METADATA_CHECK] Expert params mismatch (expected in colocate mode): "
+                f"train_only={len(train_only_experts)} experts, infer_only={len(infer_only_experts)} experts"
             )
+
+        # MLA scale params mismatch is expected (fused vs split naming difference)
+        if train_only_mla_scales or infer_only_mla_scales:
+            logger.warning(
+                f"[METADATA_CHECK] MLA scale params mismatch (expected due to fused vs split): "
+                f"train_only={len(train_only_mla_scales)}, infer_only={len(infer_only_mla_scales)}"
+            )
+
+        # Other params mismatch is a real error
+        if train_only_other or infer_only_other:
+            error_msg = (
+                f"Unexpected params mismatch: "
+                f"train_only={train_only_other}, infer_only={infer_only_other}"
+            )
+            error_count += 1
+            error_messages.append(error_msg)
+            logger.error(f"[METADATA_CHECK] {error_msg}")
+            if raise_exception:
+                raise ValueError(
+                    f"Inconsistent non-expert/non-scale parameters: "
+                    f"train_only={train_only_other}, infer_only={infer_only_other}"
+                )
+
     for param_name in common_params:
         infer_param_meta = infer_meta[param_name]
         train_param_meta = train_meta[param_name]
@@ -238,28 +378,53 @@ def check_train_infer_params_meta(
             param_name, infer_param_meta, train_param_meta, hf_config
         )
 
+        # Skip shape/numel validation for embedding/lm_head with vocab padding mismatch
+        if not skip_shape_check:
+            skip_shape_check = _is_vocab_padding_mismatch(
+                param_name, infer_param_meta, train_param_meta, hf_config
+            )
+
         if not skip_shape_check:
             if infer_param_meta.global_numel != train_param_meta.global_numel:
                 error_msg = (
                     f"Inconsistent number of elements for parameter {param_name}: "
                     f"{infer_param_meta.global_numel} != {train_param_meta.global_numel}"
                 )
+                error_count += 1
+                error_messages.append(error_msg)
                 if raise_exception:
                     raise ValueError(error_msg)
                 else:
-                    logger.error(error_msg)
+                    logger.error(f"[METADATA_CHECK] {error_msg}")
             if infer_param_meta.global_shape != train_param_meta.global_shape:
-                error_msg = f"Inconsistent shape for parameter {param_name}: {infer_param_meta.global_shape} != {train_param_meta.global_shape}"
+                error_msg = (
+                    f"Inconsistent shape for parameter {param_name}: "
+                    f"{infer_param_meta.global_shape} != {train_param_meta.global_shape}"
+                )
+                error_count += 1
+                error_messages.append(error_msg)
                 if raise_exception:
                     raise ValueError(error_msg)
                 else:
-                    logger.error(error_msg)
+                    logger.error(f"[METADATA_CHECK] {error_msg}")
         if infer_param_meta.dtype != train_param_meta.dtype:
-            error_msg = f"Inconsistent dtype for parameter {param_name}: {infer_param_meta.dtype} != {train_param_meta.dtype}"
-            if raise_exception:
-                raise ValueError(error_msg)
+            # Check if this dtype mismatch is acceptable (e.g., router bias float32 <-> bfloat16)
+            if _is_acceptable_dtype_mismatch(
+                param_name, train_param_meta.dtype, infer_param_meta.dtype
+            ):
+                # This is a warning, not an error - will convert at transfer time
+                pass
             else:
-                logger.error(error_msg)
+                error_msg = (
+                    f"Inconsistent dtype for parameter {param_name}: "
+                    f"{infer_param_meta.dtype} != {train_param_meta.dtype}"
+                )
+                error_count += 1
+                error_messages.append(error_msg)
+                if raise_exception:
+                    raise ValueError(error_msg)
+                else:
+                    logger.error(f"[METADATA_CHECK] {error_msg}")
         infer_tp_size = len(infer_param_meta.replicas[0].shards)
         train_tp_size = len(train_param_meta.replicas[0].shards)
         if infer_tp_size < train_tp_size or infer_tp_size % train_tp_size != 0:
@@ -267,10 +432,30 @@ def check_train_infer_params_meta(
                 f"Inference for parameter {param_name} has wrong tp_size: "
                 f"infer {infer_tp_size} train {train_tp_size}"
             )
+            error_count += 1
+            error_messages.append(error_msg)
             if raise_exception:
                 raise ValueError(error_msg)
             else:
-                logger.error(error_msg)
+                logger.error(f"[METADATA_CHECK] {error_msg}")
+
+    # Print summary
+    if error_count > 0:
+        logger.error(
+            f"[METADATA_CHECK] ========== SUMMARY: {error_count} ERRORS FOUND =========="
+        )
+        # Print first few errors in summary
+        for i, msg in enumerate(error_messages[:5]):
+            logger.error(f"[METADATA_CHECK]   [{i+1}] {msg}")
+        if len(error_messages) > 5:
+            logger.error(f"[METADATA_CHECK]   ... and {len(error_messages) - 5} more errors")
+        logger.error(
+            f"[METADATA_CHECK] =========================================================="
+        )
+    else:
+        logger.info(f"[METADATA_CHECK] All {len(common_params)} parameters validated successfully")
+
+    return error_count
 
 
 def pretty_bytes(size_bytes):
