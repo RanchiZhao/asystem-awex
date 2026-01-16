@@ -384,11 +384,17 @@ def test_sglang_converter_mla_fusion_split():
     assert kv_a_tensor.data_ptr() == expected_kv_offset, "kv_a_proj should share storage at offset"
 
 
-def test_sglang_converter_fp8_scale_passthrough():
-    """Test SGLang converter passes through FP8 scale parameters unchanged.
+def test_sglang_converter_fp8_scale_split():
+    """Test SGLang converter splits FP8 scale parameters for fused_qkv_a_proj_with_mqa.
 
     FP8 quantization adds auxiliary parameters like weight_scale, weight_scale_inv.
-    These should NOT be split like the main weight tensor.
+    For fused_qkv_a_proj_with_mqa, these SHOULD be split to match training-side parameters
+    which have separate q_a_proj and kv_a_proj_with_mqa scale parameters.
+
+    FP8 scale shape: (ceil(2112/128), X) = (17, 56) for fused tensor
+    Split into:
+    - q_a_proj scale: (ceil(1536/128), 56) = (12, 56)
+    - kv_a_proj_with_mqa scale: (ceil(576/128), 56) = (5, 56)
     """
     from awex.models.deepseek_v3 import SGlangToHFWeightConverterDeepSeekV3
 
@@ -404,18 +410,27 @@ def test_sglang_converter_fp8_scale_passthrough():
 
     converter = SGlangToHFWeightConverterDeepSeekV3(hf_config, infer_config, rank_info)
 
-    # Simulate FP8 block quant scale: shape (17, X) where 17 = ceil(2112/128)
-    scale_param = torch.randn(17, 56)  # Typical FP8 scale shape
+    # Simulate FP8 block quant scale: shape (17, X)
+    # where 17 = ceil(1536/128) + ceil(576/128) = 12 + 5 = 17
+    scale_param = torch.randn(17, 56)
 
-    # This should NOT raise an error and should pass through unchanged
+    # Should split into q_a_proj and kv_a_proj_with_mqa scales
     result = converter._convert_attention_param(
         "self_attn.fused_qkv_a_proj_with_mqa.weight_scale", scale_param, "0"
     )
 
-    # Should return unchanged (passthrough via parent class)
-    assert len(result) == 1
-    assert result[0][0] == "self_attn.fused_qkv_a_proj_with_mqa.weight_scale"
-    assert result[0][1] is scale_param  # Same object, not a copy
+    # Should return 2 split parameters
+    assert len(result) == 2, f"Expected 2 split params, got {len(result)}"
+
+    names = {r[0] for r in result}
+    assert "self_attn.q_a_proj.weight_scale" in names
+    assert "self_attn.kv_a_proj_with_mqa.weight_scale" in names
+
+    for name, tensor in result:
+        if "q_a_proj" in name:
+            assert tensor.shape == (12, 56), f"q_a_proj scale shape mismatch: {tensor.shape}"
+        elif "kv_a_proj_with_mqa" in name:
+            assert tensor.shape == (5, 56), f"kv_a_proj scale shape mismatch: {tensor.shape}"
 
 
 # ----------------------

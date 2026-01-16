@@ -88,6 +88,7 @@ class TransferPlanBuilder:
         num_infer_engines: int = 1,
         enable_debug_mode: bool = False,
         hf_config=None,
+        enable_colocate_mode: bool = False,
     ):
         if num_infer_engines <= 0:
             raise ValueError("num_infer_engines must be positive")
@@ -99,9 +100,11 @@ class TransferPlanBuilder:
         self.num_infer_engines = num_infer_engines
         self.enable_debug_mode = enable_debug_mode
         self.hf_config = hf_config
+        self.enable_colocate_mode = enable_colocate_mode
         logger.info(
             f"TransferPlanBuilder: infer_world_size: {infer_world_size}, train_world_size: {train_world_size}, world_size: {self.world_size}, "
-            f"infer_instance_world_size: {self.infer_instance_world_size}, num_infer_engines: {num_infer_engines}, enable_debug_mode: {enable_debug_mode}"
+            f"infer_instance_world_size: {self.infer_instance_world_size}, num_infer_engines: {num_infer_engines}, "
+            f"enable_debug_mode: {enable_debug_mode}, enable_colocate_mode: {enable_colocate_mode}"
         )
 
     def build_weights_mapping_operations(
@@ -132,24 +135,48 @@ class TransferPlanBuilder:
 
         # Get all parameter names that exist in both inference and training
         common_params = set(inference_meta_dict.keys()) & set(training_meta_dict.keys())
-        if len(common_params) != len(inference_weights_meta) or len(
-            common_params
-        ) != len(training_weights_meta):
-            logger.error(
-                f"inference weights and training weights are not consistent: {len(inference_meta_dict)}, {len(training_meta_dict)}"
+
+        # In colocate mode with EP sharding, inference side only has LOCAL parameters (e.g., its experts),
+        # while training side has ALL parameters aggregated from all ranks.
+        # We only require that all INFERENCE params exist in training (subset relationship).
+        # The extra training params (for other inference ranks) are expected.
+        if self.enable_colocate_mode:
+            # Colocate mode: inference params must be subset of training params
+            infer_only_params = set(inference_meta_dict.keys()) - set(training_meta_dict.keys())
+            if infer_only_params:
+                logger.error(
+                    f"[COLOCATE] Inference has params not in training: {len(infer_only_params)} params"
+                )
+                logger.error(f"[COLOCATE] Inference-only params (first 10): {list(infer_only_params)[:10]}")
+                raise ValueError(
+                    f"[COLOCATE] Inference has {len(infer_only_params)} params not in training: {list(infer_only_params)[:5]}..."
+                )
+            # Log the difference for debugging
+            train_only_count = len(training_meta_dict) - len(common_params)
+            logger.info(
+                f"[COLOCATE] Param matching: inference={len(inference_meta_dict)}, training={len(training_meta_dict)}, "
+                f"common={len(common_params)}, train_only={train_only_count} (expected for EP/other ranks)"
             )
-            logger.error(
-                f"inference weights and training weights are not consistent, inference weights: {list(inference_meta_dict.keys())}"
-            )
-            logger.error(
-                f"inference weights and training weights are not consistent, training weights: {list(training_meta_dict.keys())}"
-            )
-            diff_params = set(inference_meta_dict.keys()) - set(
-                training_meta_dict.keys()
-            )
-            raise ValueError(
-                f"inference weights and training weights are not consistent: {len(common_params)}, {len(inference_weights_meta)}, {len(training_weights_meta)}, {diff_params}"
-            )
+        else:
+            # Non-colocate mode: require exact match
+            if len(common_params) != len(inference_weights_meta) or len(
+                common_params
+            ) != len(training_weights_meta):
+                logger.error(
+                    f"inference weights and training weights are not consistent: {len(inference_meta_dict)}, {len(training_meta_dict)}"
+                )
+                logger.error(
+                    f"inference weights and training weights are not consistent, inference weights: {list(inference_meta_dict.keys())}"
+                )
+                logger.error(
+                    f"inference weights and training weights are not consistent, training weights: {list(training_meta_dict.keys())}"
+                )
+                diff_params = set(inference_meta_dict.keys()) - set(
+                    training_meta_dict.keys()
+                )
+                raise ValueError(
+                    f"inference weights and training weights are not consistent: {len(common_params)}, {len(inference_weights_meta)}, {len(training_weights_meta)}, {diff_params}"
+                )
 
         communication_plan = []
 

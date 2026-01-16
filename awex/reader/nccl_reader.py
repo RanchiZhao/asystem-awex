@@ -54,12 +54,15 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
 
     def initialize(self):
         super().initialize()
+
+        # Build transfer plan (both colocate and non-colocate modes need this)
         plan_builder = TransferPlanBuilder(
             self.infer_world_size,
             self.training_world_size,
             self.num_engines,
             self.enable_debug_mode,
             hf_config=self.hf_config,
+            enable_colocate_mode=self.enable_colocate_mode,
         )
         self.transfer_plan = plan_builder.build_local_transfer_plan(
             self.parameters_meta,
@@ -157,6 +160,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         self.rank_coordinate = (
             f"{self.engine_rank}-{self.rank_info.global_rank}-{self.transfer_rank}"
         )
+        # In colocate mode, initialize additional colocate-specific state
         if self.enable_colocate_mode:
             self._init_reader_in_colocate_mode()
         self.deserialized_weights = {}
@@ -204,6 +208,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             self.num_engines,
             self.enable_debug_mode,
             hf_config=self.hf_config,
+            enable_colocate_mode=self.enable_colocate_mode,
         )
         self.send_transfer_plan = plan_builder.build_local_transfer_plan(
             self.parameters_meta,

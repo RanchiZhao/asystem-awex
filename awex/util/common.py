@@ -427,10 +427,18 @@ def check_train_infer_params_meta(
                     logger.error(f"[METADATA_CHECK] {error_msg}")
         infer_tp_size = len(infer_param_meta.replicas[0].shards)
         train_tp_size = len(train_param_meta.replicas[0].shards)
-        if infer_tp_size < train_tp_size or infer_tp_size % train_tp_size != 0:
+        # Valid cases:
+        # 1. Scatter: infer_tp_size >= train_tp_size and infer_tp_size % train_tp_size == 0
+        #    Example: train TP=8, infer TP=64 -> each train shard goes to 8 infer shards
+        # 2. Gather: train_tp_size >= infer_tp_size and train_tp_size % infer_tp_size == 0
+        #    Example: train TP=8, infer TP=1 -> 8 train shards gathered into 1 infer shard
+        #    (Used for shared_experts with moe_a2a_backend=deepep where NO_SHARDING on infer)
+        is_scatter_valid = infer_tp_size % train_tp_size == 0
+        is_gather_valid = train_tp_size % infer_tp_size == 0
+        if not (is_scatter_valid or is_gather_valid):
             error_msg = (
-                f"Inference for parameter {param_name} has wrong tp_size: "
-                f"infer {infer_tp_size} train {train_tp_size}"
+                f"Inference for parameter {param_name} has incompatible tp_size: "
+                f"infer {infer_tp_size} train {train_tp_size} (neither evenly divides the other)"
             )
             error_count += 1
             error_messages.append(error_msg)

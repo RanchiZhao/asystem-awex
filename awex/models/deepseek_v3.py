@@ -110,16 +110,16 @@ class DeepSeekV3ShardingStrategy(ShardingStrategy):
         """
         sharding_dim = get_default_sharding_dim(parameter_name)
 
-        logger.info(
-            f"[DS_V3_DENSE_MLP_DEBUG] {parameter_name}: "
+        logger.debug(
+            f"[DS_V3_DENSE_MLP] {parameter_name}: "
             f"engine={self.engine_name}, moe_dense_tp_size={self.moe_dense_tp_size}, "
             f"tp_size={self.rank_info.tp_size}"
         )
 
         # SGLang with moe_dense_tp_size=1: dense layer MLP is fully replicated
         if self.engine_name == "sglang" and self.moe_dense_tp_size == 1:
-            logger.info(
-                f"[DS_V3_DENSE_MLP_DEBUG] {parameter_name}: -> NO_SHARDING "
+            logger.debug(
+                f"[DS_V3_DENSE_MLP] {parameter_name}: -> NO_SHARDING "
                 f"(moe_dense_tp_size=1, dense MLP fully replicated)"
             )
             return ShardingType.NO_SHARDING, sharding_dim, 1
@@ -127,13 +127,13 @@ class DeepSeekV3ShardingStrategy(ShardingStrategy):
         # Otherwise, use standard TP sharding
         tp_size = self.rank_info.tp_size
         if tp_size > 1:
-            logger.info(
-                f"[DS_V3_DENSE_MLP_DEBUG] {parameter_name}: -> TP_SHARDING, dim={sharding_dim}, num_shards={tp_size}"
+            logger.debug(
+                f"[DS_V3_DENSE_MLP] {parameter_name}: -> TP_SHARDING, dim={sharding_dim}, num_shards={tp_size}"
             )
             return ShardingType.TP_SHARDING, sharding_dim, tp_size
         else:
-            logger.info(
-                f"[DS_V3_DENSE_MLP_DEBUG] {parameter_name}: -> NO_SHARDING (tp_size=1)"
+            logger.debug(
+                f"[DS_V3_DENSE_MLP] {parameter_name}: -> NO_SHARDING (tp_size=1)"
             )
             return ShardingType.NO_SHARDING, sharding_dim, 1
 
@@ -173,8 +173,8 @@ class DeepSeekV3ShardingStrategy(ShardingStrategy):
         sharding_dim = get_default_sharding_dim(parameter_name)
 
         # Debug logging
-        logger.info(
-            f"[DS_V3_SHARED_EXPERT_DEBUG] {parameter_name}: "
+        logger.debug(
+            f"[DS_V3_SHARED_EXPERT] {parameter_name}: "
             f"engine={self.engine_name}, enable_dp_attention={self.enable_dp_attention}, "
             f"tp_size={self.rank_info.tp_size}, attn_tp_size={self.rank_info.attn_tp_size}, "
             f"moe_a2a_backend={self.moe_a2a_backend}"
@@ -184,8 +184,8 @@ class DeepSeekV3ShardingStrategy(ShardingStrategy):
         # This matches the behavior in SGLang's deepseek_v2.py where shared_experts
         # are created with dict(tp_rank=0, tp_size=1) when using deepep/mooncake
         if self.engine_name == "sglang" and self.moe_a2a_backend in ["deepep", "mooncake"]:
-            logger.info(
-                f"[DS_V3_SHARED_EXPERT_DEBUG] {parameter_name}: -> NO_SHARDING "
+            logger.debug(
+                f"[DS_V3_SHARED_EXPERT] {parameter_name}: -> NO_SHARDING "
                 f"(moe_a2a_backend={self.moe_a2a_backend}, shared_experts not TP-sharded)"
             )
             return ShardingType.NO_SHARDING, sharding_dim, 1
@@ -193,25 +193,25 @@ class DeepSeekV3ShardingStrategy(ShardingStrategy):
         if self.enable_dp_attention:
             attn_tp_size = self.rank_info.attn_tp_size
             if attn_tp_size > 1:
-                logger.info(
-                    f"[DS_V3_SHARED_EXPERT_DEBUG] {parameter_name}: -> DP_TP_SHARDING, dim={sharding_dim}, num_shards={attn_tp_size}"
+                logger.debug(
+                    f"[DS_V3_SHARED_EXPERT] {parameter_name}: -> DP_TP_SHARDING, dim={sharding_dim}, num_shards={attn_tp_size}"
                 )
                 return ShardingType.DP_TP_SHARDING, sharding_dim, attn_tp_size
             else:
-                logger.info(
-                    f"[DS_V3_SHARED_EXPERT_DEBUG] {parameter_name}: -> NO_SHARDING (attn_tp_size={attn_tp_size})"
+                logger.debug(
+                    f"[DS_V3_SHARED_EXPERT] {parameter_name}: -> NO_SHARDING (attn_tp_size={attn_tp_size})"
                 )
                 return ShardingType.NO_SHARDING, sharding_dim, 1
         else:
             tp_size = self.rank_info.tp_size
             if tp_size > 1:
-                logger.info(
-                    f"[DS_V3_SHARED_EXPERT_DEBUG] {parameter_name}: -> TP_SHARDING, dim={sharding_dim}, num_shards={tp_size}"
+                logger.debug(
+                    f"[DS_V3_SHARED_EXPERT] {parameter_name}: -> TP_SHARDING, dim={sharding_dim}, num_shards={tp_size}"
                 )
                 return ShardingType.TP_SHARDING, sharding_dim, tp_size
             else:
-                logger.info(
-                    f"[DS_V3_SHARED_EXPERT_DEBUG] {parameter_name}: -> NO_SHARDING (tp_size={tp_size})"
+                logger.debug(
+                    f"[DS_V3_SHARED_EXPERT] {parameter_name}: -> NO_SHARDING (tp_size={tp_size})"
                 )
                 return ShardingType.NO_SHARDING, sharding_dim, 1
 
@@ -236,7 +236,7 @@ class DeepSeekV3ShardingStrategy(ShardingStrategy):
             if self.enable_dp_attention:
                 # SGLang's VocabParallelEmbedding uses enable_tp=not is_dp_attention_enabled()
                 # So when enable_dp_attention=True, embed_tokens is replicated (no TP)
-                logger.info(
+                logger.debug(
                     f"[DS_V3_SHARDING] {parameter_name}: embed_tokens with dp_attention=True -> NO_SHARDING"
                 )
                 return ShardingType.NO_SHARDING, 0, 1
@@ -253,7 +253,7 @@ class DeepSeekV3ShardingStrategy(ShardingStrategy):
                 # SGLang's ParallelLMHead uses use_attn_tp_group=enable_dp_lm_head
                 attn_tp_size = self.rank_info.attn_tp_size
                 if attn_tp_size > 1:
-                    logger.info(
+                    logger.debug(
                         f"[DS_V3_SHARDING] {parameter_name}: lm_head with dp_lm_head=True -> DP_TP_SHARDING, attn_tp_size={attn_tp_size}"
                     )
                     return ShardingType.DP_TP_SHARDING, 0, attn_tp_size
@@ -271,7 +271,7 @@ class DeepSeekV3ShardingStrategy(ShardingStrategy):
             # Dense layers don't have "experts" in their param names, but let's be explicit
             if "expert" not in parameter_name:
                 result = self.get_dense_layer_mlp_sharding_strategy(parameter_name, **kwargs)
-                logger.info(
+                logger.debug(
                     f"[DS_V3_SHARDING] {parameter_name}: dense layer MLP -> "
                     f"{result[0].name}, dim={result[1]}, num_shards={result[2]}"
                 )
@@ -280,7 +280,7 @@ class DeepSeekV3ShardingStrategy(ShardingStrategy):
         # Shared experts: use TP sharding (NOT EP sharding like regular experts)
         if "shared_experts" in parameter_name:
             result = self.get_shared_expert_sharding_strategy(parameter_name, **kwargs)
-            logger.info(
+            logger.debug(
                 f"[DS_V3_SHARDING] {parameter_name}: shared_experts path -> "
                 f"{result[0].name}, dim={result[1]}, num_shards={result[2]}"
             )
@@ -599,37 +599,72 @@ class SGlangToHFWeightConverterDeepSeekV3(SGlangToHFWeightConverter):
         We return views of the fused tensor so P2P writes update the original.
 
         NOTE: FP8 quantization adds auxiliary parameters like weight_scale, weight_scale_inv.
-        These must be passed through without splitting.
+        These also need to be split if they correspond to fused_qkv_a_proj_with_mqa.
         """
-        # Only split the actual weight tensor, not FP8 scale parameters
-        # e.g., fused_qkv_a_proj_with_mqa.weight -> split
-        #       fused_qkv_a_proj_with_mqa.weight_scale -> pass through
-        if "fused_qkv_a_proj_with_mqa" in name and name.endswith(".weight"):
-            # Split the fused tensor into q_a and kv_a views
-            # fused shape: (q_lora_rank + kv_lora_rank + qk_rope_head_dim, hidden_size)
-            expected_size = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
-            if parameter.shape[0] != expected_size:
-                logger.warning(
-                    f"Unexpected fused_qkv_a_proj_with_mqa shape: {parameter.shape}, "
-                    f"expected first dim {expected_size}. Passing through unchanged."
+        # Handle fused_qkv_a_proj_with_mqa parameters (both weight and FP8 scales)
+        if "fused_qkv_a_proj_with_mqa" in name:
+            # Split based on the fused dimensions
+            # fused dim0: q_lora_rank + kv_lora_rank + qk_rope_head_dim
+            q_size = self.q_lora_rank
+            kv_size = self.kv_lora_rank + self.qk_rope_head_dim
+            total_size = q_size + kv_size
+
+            if name.endswith(".weight"):
+                # Split the actual weight tensor
+                expected_size = total_size
+                if parameter.shape[0] != expected_size:
+                    logger.warning(
+                        f"Unexpected fused_qkv_a_proj_with_mqa shape: {parameter.shape}, "
+                        f"expected first dim {expected_size}. Passing through unchanged."
+                    )
+                    return super()._convert_attention_param(name, parameter, layer_number)
+
+                q_a_proj = parameter.narrow(0, 0, q_size)
+                kv_a_proj = parameter.narrow(0, q_size, kv_size)
+
+                q_a_name = name.replace("fused_qkv_a_proj_with_mqa", "q_a_proj")
+                kv_a_name = name.replace("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa")
+
+                logger.debug(
+                    f"Split fused_qkv_a_proj_with_mqa: {parameter.shape} -> "
+                    f"q_a_proj {q_a_proj.shape}, kv_a_proj_with_mqa {kv_a_proj.shape}"
                 )
-                return super()._convert_attention_param(name, parameter, layer_number)
+                return [(q_a_name, q_a_proj), (kv_a_name, kv_a_proj)]
 
-            q_a_proj = parameter.narrow(0, 0, self.q_lora_rank)
-            kv_a_proj = parameter.narrow(0, self.q_lora_rank,
-                                         self.kv_lora_rank + self.qk_rope_head_dim)
+            elif "weight_scale" in name:
+                # Split FP8 scale parameters (weight_scale or weight_scale_inv)
+                # For block-wise quantization, scale dim0 = ceil(weight_dim0 / block_size)
+                # We need to split at the corresponding scale index
+                # Assume block_size[0] = 128 (DeepSeek-V3 default)
+                block_size = 128
+                q_scale_size = (q_size + block_size - 1) // block_size
+                kv_scale_size = (kv_size + block_size - 1) // block_size
+                expected_scale_size = q_scale_size + kv_scale_size
 
-            # Return both views with HF-style names
-            q_a_name = name.replace("fused_qkv_a_proj_with_mqa", "q_a_proj")
-            kv_a_name = name.replace("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa")
+                # Handle different scale tensor layouts
+                if parameter.dim() >= 1 and parameter.shape[0] == expected_scale_size:
+                    q_scale = parameter.narrow(0, 0, q_scale_size)
+                    kv_scale = parameter.narrow(0, q_scale_size, kv_scale_size)
 
-            logger.debug(
-                f"Split fused_qkv_a_proj_with_mqa: {parameter.shape} -> "
-                f"q_a_proj {q_a_proj.shape}, kv_a_proj_with_mqa {kv_a_proj.shape}"
-            )
-            return [(q_a_name, q_a_proj), (kv_a_name, kv_a_proj)]
+                    q_scale_name = name.replace("fused_qkv_a_proj_with_mqa", "q_a_proj")
+                    kv_scale_name = name.replace("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa")
 
-        # For other attention params (including FP8 scales), use parent implementation
+                    logger.debug(
+                        f"Split fused scale {name}: {parameter.shape} -> "
+                        f"q_a_proj {q_scale.shape}, kv_a_proj_with_mqa {kv_scale.shape}"
+                    )
+                    return [(q_scale_name, q_scale), (kv_scale_name, kv_scale)]
+                else:
+                    # Scale shape doesn't match expected, might be per-tensor scale
+                    # Try to pass through with split names anyway
+                    logger.warning(
+                        f"FP8 scale {name} has unexpected shape {parameter.shape}, "
+                        f"expected dim0={expected_scale_size}. Passing through as-is."
+                    )
+                    # Return with original name - training side might have matching fused param
+                    return super()._convert_attention_param(name, parameter, layer_number)
+
+        # For other attention params, use parent implementation
         return super()._convert_attention_param(name, parameter, layer_number)
 
 

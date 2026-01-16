@@ -242,8 +242,10 @@ class SGlangToHFWeightConverter:
                     # mlp.experts.63.gate_up_proj.weight
                     # mlp.experts.63.gate_proj.weight
                     # mlp.experts.63.up_proj.weight
+                    # Note: converted_name may already contain "experts." (e.g., "mlp.experts.gate_proj.weight")
+                    # so we replace "mlp.experts." to avoid duplicate "experts" in the output
                     updated_name = converted_name.replace(
-                        "mlp.", f"mlp.experts.{expert_id}."
+                        "mlp.experts.", f"mlp.experts.{expert_id}."
                     )
                     converted_params.append((updated_name, param))
             elif "w2_weight" in name:
@@ -251,8 +253,10 @@ class SGlangToHFWeightConverter:
                     name, expert_parameter, layer_number
                 ):
                     # mlp.experts.63.down_proj.weight
+                    # Note: converted_name may already contain "experts." (e.g., "mlp.experts.down_proj.weight")
+                    # so we replace "mlp.experts." to avoid duplicate "experts" in the output
                     updated_name = converted_name.replace(
-                        "mlp.", f"mlp.experts.{expert_id}."
+                        "mlp.experts.", f"mlp.experts.{expert_id}."
                     )
                     converted_params.append((updated_name, param))
             else:

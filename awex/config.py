@@ -41,6 +41,9 @@ class InferenceConfig:
     enable_eplb: Optional[bool] = None
     enable_memory_saver: Optional[bool] = None
     moe_dense_tp_size: Optional[int] = None
+    # MoE A2A backend: "none", "deepep", "mooncake", "ascend_fuseep"
+    # When using deepep/mooncake, shared_experts are NOT TP-sharded in SGLang
+    moe_a2a_backend: str = "none"
     n_share_experts_fusion: Optional[int] = None
     nnodes: Optional[int] = None
     node_rank: Optional[int] = None
