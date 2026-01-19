@@ -69,85 +69,105 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             self.training_params_meta,
             self.transfer_rank,
         )
-        if self.transfer_rank == 0:
-            master_address = get_ip_address()
-            master_port = get_free_port()
-            master_info = (master_address, master_port)
-            self.meta_server_client.put_object("master_info", master_info)
+
+        # Plan A: Try to use pre-initialized AWEX colocate group
+        # The group is created during SGLang startup with name: awex_colocate_global
+        # (ONE global group for ALL inference workers across ALL engines)
+        preinitialized_group = self._try_get_preinitialized_group()
+
+        if preinitialized_group is not None:
             logger.info(
-                f"Put master info to meta server for rank {self.transfer_rank}: {master_info}"
+                f"[NCCLWeightsReader] Using pre-initialized AWEX colocate group for rank {self.transfer_rank}"
             )
+            self.weights_update_group = preinitialized_group
+            self._use_preinitialized_group = True
         else:
-            master_info = self.meta_server_client.get_object(
-                "master_info", timeout=self.timeout
-            )
-            master_address, master_port = master_info
+            # Fall back to creating a new group (original behavior)
             logger.info(
-                f"Get master info from meta server for rank {self.transfer_rank}: {master_info}"
+                f"[NCCLWeightsReader] No pre-initialized group found, creating new group for rank {self.transfer_rank}"
             )
-        logger.info(
-            f"Start to initialize NCCL weights writer for rank {self.transfer_rank}"
-        )
+            self._use_preinitialized_group = False
 
-        from awex.util.process_group import (
-            init_weights_update_group,
-            setup_batch_isend_irecv,
-        )
+            if self.transfer_rank == 0:
+                master_address = get_ip_address()
+                master_port = get_free_port()
+                master_info = (master_address, master_port)
+                self.meta_server_client.put_object("master_info", master_info)
+                logger.info(
+                    f"Put master info to meta server for rank {self.transfer_rank}: {master_info}"
+                )
+            else:
+                master_info = self.meta_server_client.get_object(
+                    "master_info", timeout=self.timeout
+                )
+                master_address, master_port = master_info
+                logger.info(
+                    f"Get master info from meta server for rank {self.transfer_rank}: {master_info}"
+                )
+            logger.info(
+                f"Start to initialize NCCL weights writer for rank {self.transfer_rank}"
+            )
 
-        gpu_id = self.scheduler.gpu_id
-        logger.info(
-            f"[NCCLWeightsReader] Set device to {gpu_id} for rank {self.transfer_rank}, "
-            f"device env is {os.environ.get('DEVICE')}, "
-            f"previous device is {torch.cuda.current_device()}, "
-            f"device_count is {torch.cuda.device_count()}, "
-            f"CUDA_VISIBLE_DEVICES env is {os.environ.get('CUDA_VISIBLE_DEVICES')}"
-        )
-        torch.cuda.set_device(gpu_id)
-        world_size = (
-            self.infer_world_size
-            if self.enable_colocate_mode
-            else self.transfer_world_size
-        )
-        self.weights_update_group = init_weights_update_group(
-            master_address=master_address,
-            master_port=master_port,
-            rank=self.transfer_rank,
-            world_size=world_size,
-            group_name="weights_exchange",
-            role="inference",
-        )
-        logger.info(
-            f"Initialized NCCL weights reader for rank {self.transfer_rank}, engine rank {self.engine_rank}"
-        )
-        # Add a barrier to ensure all processes are ready
-        dist.barrier(
-            group=self.weights_update_group, device_ids=[torch.cuda.current_device()]
-        )
-        logger.info(f"Barrier passed for weights reader with rank {self.transfer_rank}")
-        if self.transfer_rank == 0:
-            logger.info(
-                f"Start to test NCCL ready for rank {self.transfer_rank}, world size {self.transfer_world_size}"
+            from awex.util.process_group import (
+                init_weights_update_group,
+                setup_batch_isend_irecv,
             )
-            dist.recv(
-                torch.tensor(1).cuda(),
-                src=world_size - 1,
-                group=self.weights_update_group,
+
+            gpu_id = self.scheduler.gpu_id
+            logger.info(
+                f"[NCCLWeightsReader] Set device to {gpu_id} for rank {self.transfer_rank}, "
+                f"device env is {os.environ.get('DEVICE')}, "
+                f"previous device is {torch.cuda.current_device()}, "
+                f"device_count is {torch.cuda.device_count()}, "
+                f"CUDA_VISIBLE_DEVICES env is {os.environ.get('CUDA_VISIBLE_DEVICES')}"
+            )
+            torch.cuda.set_device(gpu_id)
+            world_size = (
+                self.infer_world_size
+                if self.enable_colocate_mode
+                else self.transfer_world_size
+            )
+            self.weights_update_group = init_weights_update_group(
+                master_address=master_address,
+                master_port=master_port,
+                rank=self.transfer_rank,
+                world_size=world_size,
+                group_name="weights_exchange",
+                role="inference",
             )
             logger.info(
-                f"NCCL ready: recv tensor from rank 0 for rank {self.transfer_rank}"
+                f"Initialized NCCL weights reader for rank {self.transfer_rank}, engine rank {self.engine_rank}"
             )
-        if (
-            self.enable_colocate_mode
-            and self.transfer_rank == self.infer_world_size - 1
-        ):
-            dist.send(
-                torch.tensor(1).cuda(),
-                dst=0,
-                group=self.weights_update_group,
+            # Add a barrier to ensure all processes are ready
+            dist.barrier(
+                group=self.weights_update_group, device_ids=[torch.cuda.current_device()]
             )
-        setup_batch_isend_irecv(
-            self.weights_update_group, self.transfer_rank, world_size
-        )
+            logger.info(f"Barrier passed for weights reader with rank {self.transfer_rank}")
+            if self.transfer_rank == 0:
+                logger.info(
+                    f"Start to test NCCL ready for rank {self.transfer_rank}, world size {self.transfer_world_size}"
+                )
+                dist.recv(
+                    torch.tensor(1).cuda(),
+                    src=world_size - 1,
+                    group=self.weights_update_group,
+                )
+                logger.info(
+                    f"NCCL ready: recv tensor from rank 0 for rank {self.transfer_rank}"
+                )
+            if (
+                self.enable_colocate_mode
+                and self.transfer_rank == self.infer_world_size - 1
+            ):
+                dist.send(
+                    torch.tensor(1).cuda(),
+                    dst=0,
+                    group=self.weights_update_group,
+                )
+            setup_batch_isend_irecv(
+                self.weights_update_group, self.transfer_rank, world_size
+            )
+
         self.send_ranks = list(self.transfer_plan.operations.keys())
         self.send_ranks_sample = (
             self.send_ranks[:8] + ["..."] + self.send_ranks[-8:]
@@ -168,22 +188,153 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             f"Created NCCL weights reader for rank {self.rank_info.global_rank}, engine rank {self.engine_rank}"
         )
 
-    def _init_reader_in_colocate_mode(self):
-        self.meta_server_client.add_object_to_set(
-            "inference_device_rank_entries",
-            (get_ip_address(), torch.cuda.current_device(), self.transfer_rank),
-        )
-        self.meta_server_client.wait_set_until_size(
-            "inference_device_rank_entries", self.infer_world_size, timeout=self.timeout
-        )
-        self.inference_device_mapping = self.meta_server_client.get_set(
-            "inference_device_rank_entries"
-        )
-        self.inference_device_mapping = {
-            (ip_address, device_id): transfer_rank
-            for ip_address, device_id, transfer_rank in self.inference_device_mapping
-        }
+    def _try_get_preinitialized_group(self):
+        """
+        Try to get a pre-initialized AWEX colocate group from model_runner.
 
+        The group is created during SGLang startup by init_awex_colocate_group()
+        with name: awex_colocate_global (ONE global group for ALL inference workers)
+
+        Returns:
+            The pre-initialized group if found, None otherwise.
+        """
+        if not self.enable_colocate_mode:
+            return None
+
+        try:
+            # Access model_runner through scheduler.tp_worker
+            model_runner = self.scheduler.tp_worker.model_runner
+            model_update_groups = getattr(model_runner, '_model_update_group', {})
+
+            # CRITICAL FIX: Use the global group name, not per-engine group name
+            # All 128 inference workers share ONE NCCL group for P2P with training workers
+            group_name = "awex_colocate_global"
+
+            if group_name in model_update_groups:
+                logger.info(
+                    f"[NCCLWeightsReader] Found pre-initialized group '{group_name}' in model_runner"
+                )
+                return model_update_groups[group_name]
+            else:
+                logger.info(
+                    f"[NCCLWeightsReader] Pre-initialized group '{group_name}' not found. "
+                    f"Available groups: {list(model_update_groups.keys())}"
+                )
+                return None
+        except Exception as e:
+            logger.warning(
+                f"[NCCLWeightsReader] Failed to get pre-initialized group: {e}"
+            )
+            return None
+
+    def _init_reader_in_colocate_mode(self):
+        """Initialize reader for colocate mode with MetaServer registration.
+
+        This method checks for pre-initialized state from TpModelWorker first.
+        If available, it uses the pre-initialized inference_device_mapping
+        and skips the cleanup/registration steps (which require ALL workers
+        to be synchronized, but execute_task_in_model_worker only runs on ~2 workers).
+
+        The training side registration and transfer plan building still happens here
+        because the training side might not be ready during TpModelWorker init.
+        """
+        ip_address = get_ip_address()
+        device_id = torch.cuda.current_device()
+
+        # Check if we have pre-initialized state from TpModelWorker
+        # This state was collected when ALL workers were synchronized during init
+        pre_init_state = None
+        try:
+            if hasattr(self.scheduler, 'tp_worker') and self.scheduler.tp_worker is not None:
+                pre_init_state = self.scheduler.tp_worker.get_awex_colocate_init_state()
+        except Exception as e:
+            logger.warning(f"[NCCLWeightsReader] Failed to get pre-init state: {e}")
+
+        if pre_init_state is not None and pre_init_state.get("initialized", False):
+            # Use pre-initialized state - this was collected when ALL workers were synchronized
+            logger.info(
+                f"[NCCLWeightsReader] Using pre-initialized colocate state for {ip_address}:{device_id} "
+                f"(transfer_rank={pre_init_state['transfer_rank']}, "
+                f"infer_world_size={pre_init_state['infer_world_size']})"
+            )
+            self.inference_device_mapping = pre_init_state["inference_device_mapping"]
+            logger.info(
+                f"[NCCLWeightsReader] Pre-init inference_device_mapping has {len(self.inference_device_mapping)} entries"
+            )
+        else:
+            # Fallback: Do the original initialization (requires ALL workers to be synchronized)
+            # This path is taken when pre-init is not available (e.g., older SGLang version)
+            logger.warning(
+                f"[NCCLWeightsReader] No pre-init state available, falling back to original init "
+                f"(this requires ALL workers to call this method simultaneously!)"
+            )
+
+            # CRITICAL: Clean up stale keys from previous runs at initialization time
+            # This prevents reading old IPC handles from a previous run
+            for step_id in [1]:
+                key_suffix = f"_{ip_address}_{device_id}_{step_id}"
+                serialized_weights_key = f"training_serialized_weights{key_suffix}"
+                update_finished_key = f"weights_update_finished{key_suffix}"
+                self.meta_server_client.delete_if_exists(serialized_weights_key)
+                self.meta_server_client.delete_if_exists(update_finished_key)
+
+            # Clean up stale device rank entry sets from previous runs
+            # Only the TRUE global rank 0 (engine_rank=0 AND local_rank=0) does cleanup
+            # to avoid race conditions when multiple engines each have their own "rank 0"
+            cleanup_barrier_key = "inference_cleanup_barrier"
+            is_global_rank_zero = (self.engine_rank == 0 and self.rank_info.global_rank == 0)
+
+            if is_global_rank_zero:
+                # True global rank 0: first delete the barrier to ensure other ranks will wait
+                self.meta_server_client.delete_if_exists(cleanup_barrier_key)
+                # Clean up all stale sets
+                self.meta_server_client.delete_if_exists("inference_device_rank_entries")
+                self.meta_server_client.delete_if_exists("training_device_rank_entries")
+                self.meta_server_client.delete_if_exists("all_training_offloaded_weights")
+                # Signal cleanup is done
+                self.meta_server_client.put_object(cleanup_barrier_key, True)
+                logger.info(
+                    f"[NCCLWeightsReader] TRUE global rank 0 (engine={self.engine_rank}, "
+                    f"local={self.rank_info.global_rank}) cleaned stale device rank entry sets"
+                )
+            else:
+                # Wait for global rank 0 cleanup - with retry in case we're faster than rank 0's delete
+                import time
+                max_retries = 30
+                for i in range(max_retries):
+                    try:
+                        self.meta_server_client.get_object(cleanup_barrier_key, timeout=10)
+                        break
+                    except Exception:
+                        if i < max_retries - 1:
+                            time.sleep(1)
+                        else:
+                            raise
+
+            logger.info(
+                f"[NCCLWeightsReader] Cleaned stale keys for {ip_address}:{device_id} "
+                f"before initialization"
+            )
+
+            self.meta_server_client.add_object_to_set(
+                "inference_device_rank_entries",
+                (get_ip_address(), torch.cuda.current_device(), self.transfer_rank),
+            )
+            self.meta_server_client.wait_set_until_size(
+                "inference_device_rank_entries", self.infer_world_size, timeout=self.timeout
+            )
+            self.inference_device_mapping = self.meta_server_client.get_set(
+                "inference_device_rank_entries"
+            )
+            self.inference_device_mapping = {
+                (ip_address, device_id): transfer_rank
+                for ip_address, device_id, transfer_rank in self.inference_device_mapping
+            }
+
+        # Wait for training side to register (training side might not be ready during TpModelWorker init)
+        logger.info(
+            f"[NCCLWeightsReader] Waiting for {self.training_world_size} training workers to register..."
+        )
         self.meta_server_client.wait_set_until_size(
             "training_device_rank_entries",
             self.training_world_size,
@@ -196,10 +347,40 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             (ip_address, device_id): transfer_rank
             for ip_address, device_id, transfer_rank in device_rank_entries
         }
+
+        # Debug: Log both mappings to diagnose IP/device mismatches
+        inference_ips = set(ip for ip, dev in self.inference_device_mapping.keys())
+        training_ips = set(ip for ip, dev in self.training_device_mapping.keys())
+        logger.info(
+            f"[NCCLWeightsReader] Inference IPs: {sorted(inference_ips)}"
+        )
+        logger.info(
+            f"[NCCLWeightsReader] Training IPs: {sorted(training_ips)}"
+        )
+        logger.info(
+            f"[NCCLWeightsReader] Inference mapping sample: {list(self.inference_device_mapping.items())[:5]}"
+        )
+        logger.info(
+            f"[NCCLWeightsReader] Training mapping sample: {list(self.training_device_mapping.items())[:5]}"
+        )
+
         self.train_to_infer_device_mapping = {}
         self.infer_to_train_device_mapping = {}
         for ip_address, device_id, transfer_rank in device_rank_entries:
-            infer_rank = self.inference_device_mapping[(ip_address, device_id)]
+            key = (ip_address, device_id)
+            if key not in self.inference_device_mapping:
+                # Log detailed error info for debugging
+                logger.error(
+                    f"[NCCLWeightsReader] Training device {key} not found in inference_device_mapping! "
+                    f"This usually means training and inference are not on the same machines (not colocate). "
+                    f"Available inference devices: {list(self.inference_device_mapping.keys())[:10]}..."
+                )
+                raise KeyError(
+                    f"Training device {key} not found in inference_device_mapping. "
+                    f"Training IPs: {sorted(training_ips)}, Inference IPs: {sorted(inference_ips)}. "
+                    f"Ensure training and inference workers are on the same machines for colocate mode."
+                )
+            infer_rank = self.inference_device_mapping[key]
             self.train_to_infer_device_mapping[transfer_rank] = infer_rank
             self.infer_to_train_device_mapping[infer_rank] = transfer_rank
         plan_builder = TransferPlanBuilder(
@@ -243,6 +424,19 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         self.send_rank, self.send_rank_info, serialized_weights = (
             self.meta_server_client.get_object(key, timeout=self.timeout)
         )
+        # [CRITICAL_VERIFY] Check if IPC send_rank matches mapping expectation
+        expected_train_rank = self.infer_to_train_device_mapping.get(self.transfer_rank)
+        if self.send_rank != expected_train_rank:
+            logger.error(
+                f"[RANK_MISMATCH] rank={self.rank_coordinate} transfer_rank={self.transfer_rank} "
+                f"IPC send_rank={self.send_rank} != expected_train_rank={expected_train_rank} "
+                f"(from infer_to_train_device_mapping). This causes COLOCATE_MISMATCH!"
+            )
+        else:
+            logger.info(
+                f"[RANK_VERIFY_OK] rank={self.rank_coordinate} transfer_rank={self.transfer_rank} "
+                f"IPC send_rank={self.send_rank} matches expected_train_rank={expected_train_rank}"
+            )
         logger.info(
             f"Finished getting serialized ipc weights {key} for rank {self.rank_coordinate}"
         )
@@ -361,6 +555,29 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             f"Start to update weights using NCCL for step {step_id} from {len(self.transfer_plan.operations)} "
             f"ranks({self.send_ranks_sample}) for rank {self.rank_coordinate}."
         )
+
+        # [DEBUG] Check for missing keys in deserialized_weights before P2P
+        if self.deserialized_weights is not None and self.send_transfer_plan is not None:
+            required_send_params = set()
+            for peer_rank, ops in self.send_transfer_plan.operations.items():
+                for op in ops:
+                    required_send_params.add(op.send_shard_meta.name)
+            available_params = set(self.deserialized_weights.keys())
+            missing_params = required_send_params - available_params
+            if missing_params:
+                logger.error(
+                    f"[DEBUG] rank={self.transfer_rank} MISSING PARAMS in deserialized_weights: "
+                    f"{list(missing_params)[:10]}... (total {len(missing_params)} missing)"
+                )
+                logger.error(
+                    f"[DEBUG] rank={self.transfer_rank} available params sample: "
+                    f"{list(available_params)[:10]}... (total {len(available_params)})"
+                )
+                logger.error(
+                    f"[DEBUG] rank={self.transfer_rank} required params sample: "
+                    f"{list(required_send_params)[:10]}... (total {len(required_send_params)})"
+                )
+
         t3 = time.time()
         self.colocate_transport.update_weights_in_colocate_mode(
             self.train_to_infer_device_mapping,

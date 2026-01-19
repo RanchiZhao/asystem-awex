@@ -140,11 +140,69 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         ip_address = get_ip_address()
         self._set_device()
         device_id = torch.cuda.current_device()
+
+        # CRITICAL: Wait for inference side to finish cleanup
+        # The inference side uses two-phase cleanup with epoch:
+        # - inference_cleanup_starting: signals cleanup is starting
+        # - inference_cleanup_done: signals cleanup is complete
+        # We wait for inference_cleanup_done to ensure cleanup is complete before registering
+        cleanup_done_key = "inference_cleanup_done"
+        cleanup_barrier_key = "inference_cleanup_barrier"  # Legacy key for backwards compatibility
+        import time
+        max_retries = 120  # Wait up to 120 seconds for inference to start and complete cleanup
+        cleanup_found = False
+        for i in range(max_retries):
+            try:
+                # Try new key first
+                self.meta_server_client.get_object(cleanup_done_key, timeout=3)
+                logger.info(
+                    f"[NCCLWeightsWriter] Rank {self.transfer_rank}: inference cleanup_done found"
+                )
+                cleanup_found = True
+                break
+            except Exception:
+                try:
+                    # Fallback to legacy key for backwards compatibility
+                    self.meta_server_client.get_object(cleanup_barrier_key, timeout=2)
+                    logger.info(
+                        f"[NCCLWeightsWriter] Rank {self.transfer_rank}: inference cleanup_barrier (legacy) found"
+                    )
+                    cleanup_found = True
+                    break
+                except Exception:
+                    if i < max_retries - 1:
+                        if i % 10 == 0:
+                            logger.info(
+                                f"[NCCLWeightsWriter] Rank {self.transfer_rank}: waiting for inference cleanup... ({i+1}/{max_retries})"
+                            )
+                        time.sleep(1)
+                    else:
+                        logger.warning(
+                            f"[NCCLWeightsWriter] Rank {self.transfer_rank}: timeout waiting for inference cleanup, proceeding anyway"
+                        )
+
         self.meta_server_client.add_object_to_set(
             "training_device_rank_entries", (ip_address, device_id, self.transfer_rank)
         )
+        # [TRAIN_REGISTER] Log registration details for debugging rank mismatch
+        megatron_rank = self.transfer_rank - self.infer_world_size
+        pp_rank = getattr(self.rank_info, 'pp_rank', 'N/A')
+        tp_rank = getattr(self.rank_info, 'tp_rank', 'N/A')
         logger.info(
-            f"Initialized NCCL weights writer for rank {self.transfer_rank} in colocate mode"
+            f"[TRAIN_REGISTER] ip={ip_address} device={device_id} transfer_rank={self.transfer_rank} "
+            f"megatron_rank={megatron_rank} pp_rank={pp_rank} tp_rank={tp_rank}"
+        )
+
+        # Clean up stale IPC keys from previous runs
+        for step_id in [1]:
+            key_suffix = f"_{ip_address}_{device_id}_{step_id}"
+            serialized_weights_key = f"training_serialized_weights{key_suffix}"
+            update_finished_key = f"weights_update_finished{key_suffix}"
+            self.meta_server_client.delete_if_exists(serialized_weights_key)
+            self.meta_server_client.delete_if_exists(update_finished_key)
+        logger.info(
+            f"Initialized NCCL weights writer for rank {self.transfer_rank} in colocate mode "
+            f"(cleaned stale keys for {ip_address}:{device_id})"
         )
 
     @torch.no_grad()
@@ -296,6 +354,12 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         device_id = torch.cuda.current_device()
         key_suffix = f"_{ip_address}_{device_id}_{step_id}"
         serialized_weights_key = f"training_serialized_weights{key_suffix}"
+        update_finished_key = f"weights_update_finished{key_suffix}"
+        # CRITICAL: Delete old keys before putting new data to prevent stale IPC handles
+        # If old data from a previous run exists, inference may read stale CUDA IPC handles
+        # which point to memory from a dead process, causing "invalid resource handle" errors
+        self.meta_server_client.delete_if_exists(serialized_weights_key)
+        self.meta_server_client.delete_if_exists(update_finished_key)
         self.meta_server_client.put_object(
             serialized_weights_key,
             (self.transfer_rank, self.rank_info, serialized_weights),
@@ -305,7 +369,6 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         logger.info(f"[PROFILE] train_rank={self.transfer_rank} step={step_id} metaserver_put: {put_time:.3f}s")
 
         # Wait for inference engines to finish processing
-        update_finished_key = f"weights_update_finished{key_suffix}"
         logger.info(
             f"[Writer Rank {self.transfer_rank}] Waiting for inference engines to finish "
             f"(key={update_finished_key}, timeout={self.timeout}s, step_id={step_id})"
@@ -320,6 +383,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
 
         # Cleanup - simplified (Reader no longer waits for write_finished)
         self.meta_server_client.delete_if_exists(update_finished_key)
+        self.meta_server_client.delete_if_exists(serialized_weights_key)
         release_tensors(group_tensors)
         release_tensors(group_shared)
         del group_tensors

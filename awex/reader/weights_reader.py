@@ -153,7 +153,7 @@ class WeightsReader(WeightExchangeReader):
             config.dump_weights_dir_for_validation or os.getcwd()
         )
         self.ipc_backend = config.weights_exchange_ipc_backend
-        self.timeout = 10000
+        self.timeout = 180  # 180 seconds timeout for multi-engine initialization sync
         self.lock = threading.Lock()
         self.initialized = False
         logger.info(
@@ -422,9 +422,8 @@ class WeightsReader(WeightExchangeReader):
     def _resume_weights_memory_occupation(self):
         """Resume weights memory for validation flow.
 
-        IMPORTANT: resume_memory_occupation has torch.distributed.barrier(tp_cpu_group)
-        which requires ALL TP workers to participate. Since only node_rank=0 workers
-        call WeightsReader methods, we MUST broadcast via execute_task_in_model_worker.
+        NOTE: execute_task_in_model_worker only runs on ONE worker, not all 64.
+        We've removed the barrier from _resume_weights_in_tp_worker to avoid deadlock.
         """
         assert self.enable_colocate_mode
         logger.info(
@@ -434,7 +433,7 @@ class WeightsReader(WeightExchangeReader):
             "all_training_offloaded_optimizers", timeout=self.timeout
         )
         logger.info(
-            "All train ranks have offloaded optimizer states, broadcasting resume to all TP workers"
+            "All train ranks have offloaded optimizer states, resuming weights on current worker"
         )
         self.inference_engine.execute_task_in_model_worker(
             self._resume_weights_in_tp_worker
@@ -443,10 +442,10 @@ class WeightsReader(WeightExchangeReader):
 
     @staticmethod
     def _resume_weights_in_tp_worker(**kwargs):
-        """Resume weights memory on all TP workers.
+        """Resume weights memory on the current worker.
 
-        This is called via execute_task_in_model_worker so ALL 64 workers participate,
-        allowing the barrier inside resume_memory_occupation to succeed.
+        CRITICAL: execute_task_in_model_worker only runs on ONE scheduler/worker, NOT all 64!
+        Therefore we MUST NOT use a barrier here - it would deadlock.
         """
         model_context = kwargs["model_context"]
         scheduler = model_context["scheduler"]
@@ -455,8 +454,7 @@ class WeightsReader(WeightExchangeReader):
         if GPU_MEMORY_TYPE_WEIGHTS in scheduler.offload_tags:
             scheduler.offload_tags.remove(GPU_MEMORY_TYPE_WEIGHTS)
             scheduler.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
-            import torch
-            torch.distributed.barrier(scheduler.tp_cpu_group)
+            # NOTE: No barrier here! execute_task_in_model_worker only reaches ONE worker.
             # Import static state back
             if hasattr(scheduler, 'stashed_model_static_state'):
                 from sglang.srt.managers.scheduler_update_weights_mixin import _import_static_state
@@ -465,7 +463,7 @@ class WeightsReader(WeightExchangeReader):
                     scheduler.stashed_model_static_state,
                 )
                 del scheduler.stashed_model_static_state
-            logger.info(f"[_resume_weights_in_tp_worker] Resumed weights memory")
+            logger.info(f"[_resume_weights_in_tp_worker] Resumed weights memory (no barrier)")
         else:
             logger.info(f"[_resume_weights_in_tp_worker] weights not in offload_tags, skipping")
 
@@ -474,11 +472,10 @@ class WeightsReader(WeightExchangeReader):
         self.meta_server_client.add_object_to_set(
             "finished_weights_update_engines", self.engine_rank
         )
-        # IMPORTANT: resume_memory_occupation has torch.distributed.barrier(tp_cpu_group)
-        # which requires ALL TP workers to participate. Since only node_rank=0 workers
-        # call WeightsReader methods, we MUST broadcast via execute_task_in_model_worker.
+        # NOTE: execute_task_in_model_worker only runs on ONE worker, not all 64.
+        # The kv_cache resume doesn't require a barrier, so this is safe.
         logger.info(
-            f"[_resume_kvcache_memory_occupation] Broadcasting kv_cache resume to all TP workers"
+            f"[_resume_kvcache_memory_occupation] Resuming kv_cache on current worker"
         )
         self.inference_engine.execute_task_in_model_worker(
             self._resume_kvcache_in_tp_worker
@@ -489,10 +486,9 @@ class WeightsReader(WeightExchangeReader):
 
     @staticmethod
     def _resume_kvcache_in_tp_worker(**kwargs):
-        """Resume KV cache memory on all TP workers.
+        """Resume KV cache memory on the current worker.
 
-        This is called via execute_task_in_model_worker so ALL 64 workers participate,
-        allowing the barrier inside resume_memory_occupation to succeed.
+        CRITICAL: execute_task_in_model_worker only runs on ONE scheduler/worker, NOT all 64!
         """
         model_context = kwargs["model_context"]
         scheduler = model_context["scheduler"]
@@ -776,19 +772,17 @@ class WeightsReader(WeightExchangeReader):
             timeout=self.timeout,
         )
         logger.info(
-            f"[_pre_update_weights] Training has offloaded weights, now broadcasting resume to all TP workers"
+            f"[_pre_update_weights] Training has offloaded weights, resuming weights on current worker"
         )
-        # IMPORTANT: resume_memory_occupation has torch.distributed.barrier(tp_cpu_group)
-        # which requires ALL TP workers to participate. Since only node_rank=0 workers
-        # call WeightsReader methods, we MUST broadcast via execute_task_in_model_worker
-        # to ensure all 64 workers call resume_memory_occupation together.
-        _log_gpu_memory(f"WeightsReader._pre_update_weights BEFORE resume_weights (via broadcast) step={step_id}")
+        # NOTE: execute_task_in_model_worker only runs on ONE worker, not all 64.
+        # We've removed the barrier from _pre_update_weights_in_tp_worker to avoid deadlock.
+        _log_gpu_memory(f"WeightsReader._pre_update_weights BEFORE resume_weights step={step_id}")
         self.inference_engine.execute_task_in_model_worker(
             self._pre_update_weights_in_tp_worker,
             step_id=step_id,
             resume_weights=True,  # Signal to resume weights inside the worker
         )
-        _log_gpu_memory(f"WeightsReader._pre_update_weights AFTER resume_weights (via broadcast) step={step_id}")
+        _log_gpu_memory(f"WeightsReader._pre_update_weights AFTER resume_weights step={step_id}")
         logger.info(
             f"Finished pre-updating weights for step {step_id} in colocate mode on engine rank {self.engine_rank}"
         )
@@ -799,23 +793,22 @@ class WeightsReader(WeightExchangeReader):
         scheduler = model_context["scheduler"]
         resume_weights = kwargs.pop("resume_weights", False)
 
-        # Resume weights memory occupation - this is called on ALL TP workers
-        # so the barrier inside resume_memory_occupation will succeed
+        # Resume weights memory occupation
+        # CRITICAL: execute_task_in_model_worker only runs on ONE scheduler/worker, NOT all 64!
+        # Therefore we MUST NOT use a barrier here - it would deadlock.
+        # The memory_saver.resume operation is idempotent and doesn't require synchronization.
         if resume_weights:
             logger.info(
                 f"[_pre_update_weights_in_tp_worker] Calling resume_memory_occupation('weights') "
                 f"on rank {scheduler.tp_rank if hasattr(scheduler, 'tp_rank') else 'unknown'}"
             )
-            # Use memory_saver_adapter.resume directly to avoid idempotent issues
-            # Since Slime's offload_rollout called release_memory_occupation on all workers,
-            # we need to resume on all workers too
             from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
             if GPU_MEMORY_TYPE_WEIGHTS in scheduler.offload_tags:
                 scheduler.offload_tags.remove(GPU_MEMORY_TYPE_WEIGHTS)
                 scheduler.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
-                import torch
-                torch.distributed.barrier(scheduler.tp_cpu_group)
-                # Import static state back
+                # NOTE: No barrier here! execute_task_in_model_worker only reaches ONE worker,
+                # so a barrier would hang forever waiting for the other 63 workers.
+                # Import static state back if it was stashed
                 if hasattr(scheduler, 'stashed_model_static_state'):
                     from sglang.srt.managers.scheduler_update_weights_mixin import _import_static_state
                     _import_static_state(
@@ -823,7 +816,7 @@ class WeightsReader(WeightExchangeReader):
                         scheduler.stashed_model_static_state,
                     )
                     del scheduler.stashed_model_static_state
-                logger.info(f"[_pre_update_weights_in_tp_worker] Resumed weights memory")
+                logger.info(f"[_pre_update_weights_in_tp_worker] Resumed weights memory (no barrier)")
             else:
                 logger.info(f"[_pre_update_weights_in_tp_worker] weights not in offload_tags, skipping resume")
 
@@ -835,6 +828,10 @@ class WeightsReader(WeightExchangeReader):
         model_context = kwargs["model_context"]
         scheduler = model_context["scheduler"]
         weights_reader = scheduler.awes_weights_reader
+        logger.info(
+            f"[DEBUG] _update_parameters_in_tp_worker: weights_reader type={type(weights_reader).__name__}, "
+            f"enable_colocate_mode={getattr(weights_reader, 'enable_colocate_mode', 'N/A')}"
+        )
         weights_reader.update_weights(**kwargs)
 
 
@@ -936,7 +933,7 @@ class WorkerWeightsReader:
             f"[Reader {self.transfer_rank}] Total local number of elements: {self.total_local_num_elements}, "
             f"total local parameter size: {self.total_local_param_size}"
         )
-        self.timeout = 10000
+        self.timeout = 180  # 180 seconds timeout for multi-engine initialization sync
         self._history_update_weights_time = {}
         logger.info(f"Env varabbles for weights reader: {stripped_env_vars()}")
         logger.info(
@@ -1045,7 +1042,12 @@ class WorkerWeightsReader:
     def update_weights(self, step_id, **kwargs):
         start_time = time.time()
         torch.cuda.synchronize()
+        logger.info(
+            f"[DEBUG] WorkerWeightsReader.update_weights: step={step_id} "
+            f"enable_colocate_mode={self.enable_colocate_mode} transfer_rank={self.transfer_rank}"
+        )
         if self.enable_colocate_mode:
+            logger.info(f"[DEBUG] Calling _update_weights_in_colocate_mode for step={step_id}")
             self._update_weights_in_colocate_mode(step_id, **kwargs)
         else:
             self._update_weights(step_id, **kwargs)

@@ -116,7 +116,7 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
         logger.info(f"Disable pipeline for weights writer: {self.disable_pipeline}")
         logger.info(f"Env variables for weights writer: {stripped_env_vars()}")
         self.lock = threading.Lock()
-        self.timeout = 10000
+        self.timeout = 30  # 30 seconds timeout for faster failure detection
         self.initialized = False
         self.num_infer_engines = None
         self.engine_name = train_engine.engine_name

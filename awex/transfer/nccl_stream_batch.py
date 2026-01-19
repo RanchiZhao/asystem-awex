@@ -90,6 +90,34 @@ class NcclColocateStreamBatchTransport:
         tensors_to_copy = []
         train_slice_context = {}
 
+        # [DEBUG] Log summary of send_parameters vs send_ops expectations
+        expected_params = set()
+        for _, ops in send_ops.items():
+            for op in ops:
+                expected_params.add(op.send_shard_meta.name)
+        available_params = set(send_parameters.keys())
+        missing_params = expected_params - available_params
+        if missing_params:
+            # This indicates a mismatch between transfer plan and actual data!
+            logger.error(
+                f"[COLOCATE_MISMATCH] rank={rank_coordinate} transfer_rank={transfer_rank} "
+                f"MISSING {len(missing_params)} params in send_parameters! "
+                f"Expected {len(expected_params)}, available {len(available_params)}"
+            )
+            logger.error(
+                f"[COLOCATE_MISMATCH] missing sample: {sorted(missing_params)[:5]}"
+            )
+            logger.error(
+                f"[COLOCATE_MISMATCH] available sample: {sorted(available_params)[:5]}"
+            )
+            # Log the send_transfer_plan details
+            for pr, ops_list in list(send_ops.items())[:2]:
+                for op in ops_list[:2]:
+                    logger.error(
+                        f"[COLOCATE_MISMATCH] plan op: peer_rank={pr} param={op.send_shard_meta.name} "
+                        f"send_rank={op.send_rank} recv_rank={op.recv_rank}"
+                    )
+
         # Process send operations
         for peer_rank, ops in send_ops.items():
             # Map training rank to inference rank in colocate mode
@@ -97,7 +125,14 @@ class NcclColocateStreamBatchTransport:
             if mapped_peer_rank == transfer_rank:
                 # Self-copy operations
                 for op in ops:
-                    send_tensor = send_parameters[op.send_shard_meta.name]
+                    param_name = op.send_shard_meta.name
+                    if param_name not in send_parameters:
+                        logger.warning(
+                            f"[COLOCATE_SKIP] rank={rank_coordinate} skipping self-copy for "
+                            f"missing param {param_name} (send_rank={op.send_rank})"
+                        )
+                        continue
+                    send_tensor = send_parameters[param_name]
                     tensor_sliced = slice_tensor(
                         send_tensor, op, True, slice_context=train_slice_context
                     )
@@ -114,7 +149,14 @@ class NcclColocateStreamBatchTransport:
                 # P2P send operations
                 p2p_ops = []
                 for op in ops:
-                    send_tensor = send_parameters[op.send_shard_meta.name]
+                    param_name = op.send_shard_meta.name
+                    if param_name not in send_parameters:
+                        logger.warning(
+                            f"[COLOCATE_SKIP] rank={rank_coordinate} skipping P2P send for "
+                            f"missing param {param_name} (send_rank={op.send_rank}, recv_rank={op.recv_rank})"
+                        )
+                        continue
+                    send_tensor = send_parameters[param_name]
                     tensor_sliced = slice_tensor(
                         send_tensor, op, True, slice_context=train_slice_context
                     )

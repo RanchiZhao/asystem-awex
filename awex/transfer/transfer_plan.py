@@ -245,6 +245,18 @@ class TransferPlanBuilder:
             )
         training_replicas = training_meta.replicas
 
+        # [DEBUG] Log training replicas info for embed_tokens to diagnose colocate mismatch
+        if "embed_tokens" in param_name:
+            train_global_ranks = []
+            for replica in training_replicas:
+                for shard in replica.shards:
+                    train_global_ranks.append(shard.global_rank)
+            logger.info(
+                f"[EMBED_DEBUG] param={param_name} num_training_replicas={len(training_replicas)} "
+                f"training_global_ranks={sorted(set(train_global_ranks))} "
+                f"global_transfer_rank={global_transfer_rank}"
+            )
+
         if not inference_replicas or not training_replicas:
             raise ValueError(f"No replicas found for parameter {param_name}")
 

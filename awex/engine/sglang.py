@@ -61,9 +61,53 @@ class SGLangEngine(InferenceEngine):
 
     def initialize(self) -> None:
         import time
-        # In per-node mode, all engines initialize (not just node_rank=0)
-        # because each engine independently handles weight updates for its 8 GPUs.
-        should_initialize = self._awex_per_node_mode or self.config.node_rank == 0
+        # Determine if this engine should initialize weights exchange reader.
+        #
+        # There are three modes:
+        # 1. awex_per_node_mode=True: All engines initialize independently
+        #    (each handles its own 8 GPUs)
+        # 2. Multi-node engine (tp_size > 8 or nodes_per_engine > 1):
+        #    All nodes in each engine must initialize so that all workers can participate
+        #    in init_weights_update_group together. This applies regardless of num_engines.
+        #    Example: num_engines=2, tp_size=64 means each engine uses 8 nodes,
+        #    so all 8 nodes per engine must initialize.
+        # 3. Regular mode: Only node_rank=0 initializes
+        #
+        # The key insight for mode 2: init_weights_update_group requires ALL
+        # workers (64 in our case) to call it simultaneously. If only node_rank=0
+        # initializes (8 workers), the other 56 workers won't participate,
+        # causing deadlock.
+
+        # Detect multi-node engine mode
+        nnodes = getattr(self.config, 'nnodes', None)
+        tp_size = getattr(self.config, 'tp_size', None)
+        num_gpus_per_node = 8  # Standard assumption
+
+        # Check if each engine spans multiple nodes
+        # This is true when tp_size > num_gpus_per_node, regardless of num_engines
+        # For example: 2 engines with tp_size=64 each means each engine uses 8 nodes
+        is_multi_node_engine = False
+        if tp_size is not None and tp_size > num_gpus_per_node:
+            # tp_size > 8 implies this engine spans multiple nodes
+            is_multi_node_engine = True
+        elif nnodes is not None:
+            # Calculate nodes per engine
+            nodes_per_engine = nnodes // max(self.config.num_engines, 1)
+            if nodes_per_engine > 1:
+                is_multi_node_engine = True
+
+        should_initialize = (
+            self._awex_per_node_mode or
+            is_multi_node_engine or
+            self.config.node_rank == 0
+        )
+
+        logger.info(
+            f"[SGLangEngine] {self.rank_coordinate}: Initialize decision - "
+            f"per_node_mode={self._awex_per_node_mode}, "
+            f"multi_node_engine={is_multi_node_engine} (nnodes={nnodes}, tp_size={tp_size}, num_engines={self.config.num_engines}), "
+            f"node_rank={self.config.node_rank}, should_initialize={should_initialize}"
+        )
 
         if should_initialize:
             logger.info(
@@ -113,11 +157,15 @@ class SGLangEngine(InferenceEngine):
         # Use step_id from kwargs if provided, otherwise fallback to global_step
         step_id = kwargs.pop('step_id', self.global_step)
 
-        # In per-node mode, all engines execute update_weights (not just node_rank=0)
-        # because each engine independently handles weight updates for its 8 GPUs.
-        # In standard mode, only node_rank=0 workers have initialized weights_exchange_reader
-        # Other workers skip the update (they participate via execute_task_in_model_worker)
-        should_update = self._awex_per_node_mode or self.node_rank == 0
+        # In multi-node engine mode, all nodes must participate in update_weights
+        # because each node's inference engine receives weights for its GPUs.
+        # In per-node mode, all engines also execute independently.
+        # In standard single-node mode, only node_rank=0 workers have initialized weights_exchange_reader
+        tp_size = getattr(self._config, 'tp_size', None)
+        num_gpus_per_node = 8
+        is_multi_node_engine = tp_size is not None and tp_size > num_gpus_per_node
+
+        should_update = self._awex_per_node_mode or is_multi_node_engine or self.node_rank == 0
 
         if not should_update:
             logger.info(
@@ -141,8 +189,12 @@ class SGLangEngine(InferenceEngine):
         tags = tags or ["kv_cache", "weights"]
         if isinstance(tags, str):
             tags = [tags]
-        # In per-node mode, all engines can release memory (not just node_rank=0)
-        should_release = self._awex_per_node_mode or self.node_rank == 0
+        # In multi-node engine mode, all nodes can release memory
+        tp_size = getattr(self._config, 'tp_size', None)
+        num_gpus_per_node = 8
+        is_multi_node_engine = tp_size is not None and tp_size > num_gpus_per_node
+
+        should_release = self._awex_per_node_mode or is_multi_node_engine or self.node_rank == 0
         if self._initialized and should_release:
             logger.info(
                 f"Release memory occupation {tags}, released_tags {self.released_tags}"
@@ -166,8 +218,12 @@ class SGLangEngine(InferenceEngine):
         tags = tags or ["kv_cache", "weights"]
         if isinstance(tags, str):
             tags = [tags]
-        # In per-node mode, all engines can resume memory (not just node_rank=0)
-        should_resume = self._awex_per_node_mode or self.node_rank == 0
+        # In multi-node engine mode, all nodes can resume memory
+        tp_size = getattr(self._config, 'tp_size', None)
+        num_gpus_per_node = 8
+        is_multi_node_engine = tp_size is not None and tp_size > num_gpus_per_node
+
+        should_resume = self._awex_per_node_mode or is_multi_node_engine or self.node_rank == 0
         if self._initialized and should_resume:
             logger.info(
                 f"Resume memory occupation {tags}, released_tags {self.released_tags}"
@@ -186,8 +242,14 @@ class SGLangEngine(InferenceEngine):
     def execute_task_in_model_worker(self, fn, **kwargs):
         if not self._initialized:
             raise RuntimeError("Engine not initialized. Call `initialize` first.")
-        # In per-node mode, all engines can execute tasks (not just node_rank=0)
-        should_execute = self._awex_per_node_mode or self.node_rank == 0
+        # In multi-node engine mode, all nodes need to execute tasks (not just node_rank=0)
+        # This is required for colocate mode where each node's inference engine
+        # must participate in weight synchronization
+        tp_size = getattr(self._config, 'tp_size', None)
+        num_gpus_per_node = 8
+        is_multi_node_engine = tp_size is not None and tp_size > num_gpus_per_node
+
+        should_execute = self._awex_per_node_mode or is_multi_node_engine or self.node_rank == 0
         if not should_execute:
             raise RuntimeError(
                 f"Non-zero rank node {self.rank_coordinate} is not allowed to "
